@@ -100,10 +100,56 @@ install_prerequisites() {
 }
 
 print_disk_diagnostics() {
+    local root_source=""
+    local boot_device=""
+    local device_path
+    local device_name
+    local device_type
+    local sectors
+    local model
+
+    if command -v findmnt >/dev/null 2>&1; then
+        root_source="$(findmnt -no SOURCE / 2>/dev/null || true)"
+    fi
+    if [[ -z "$root_source" && -r /proc/self/mounts ]]; then
+        root_source="$(awk '$2 == "/" {print $1; exit}' /proc/self/mounts)"
+    fi
+    if command -v grub-probe >/dev/null 2>&1; then
+        boot_device="$(grub-probe --target=device /boot 2>/dev/null || true)"
+    fi
+
     printf '\nRead-only disk diagnostics:\n' >&2
-    printf 'Root filesystem: ' >&2
-    findmnt -no SOURCE / 2>/dev/null >&2 || printf 'unknown\n' >&2
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL 2>/dev/null >&2 || true
+    printf 'Root filesystem: %s\n' "${root_source:-unknown}" >&2
+    printf 'GRUB /boot device: %s\n' "${boot_device:-unknown}" >&2
+
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL >&2 || true
+    else
+        printf '\nBlock devices from /sys/class/block (size is in 512-byte sectors):\n' >&2
+        printf '%-16s %-10s %-14s %s\n' 'NAME' 'TYPE' 'SECTORS' 'MODEL' >&2
+        for device_path in /sys/class/block/*; do
+            [[ -e "$device_path" ]] || continue
+            device_name="${device_path##*/}"
+            if [[ -f "$device_path/partition" ]]; then
+                device_type="partition"
+            else
+                device_type="disk"
+            fi
+            sectors="$(cat "$device_path/size" 2>/dev/null || printf '?')"
+            model="$(tr -s ' ' < "$device_path/device/model" 2>/dev/null || true)"
+            printf '%-16s %-10s %-14s %s\n' "$device_name" "$device_type" "$sectors" "$model" >&2
+        done
+    fi
+
+    if [[ -d /dev/disk/by-id ]]; then
+        printf '\nCurrent /dev/disk/by-id links:\n' >&2
+        ls -l /dev/disk/by-id 2>/dev/null >&2 || true
+    fi
+
+    if command -v debconf-show >/dev/null 2>&1; then
+        printf '\nSaved grub-pc install-device setting:\n' >&2
+        debconf-show grub-pc 2>/dev/null | grep 'grub-pc/install_devices' >&2 || true
+    fi
 }
 
 check_package_manager_health() {
