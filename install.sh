@@ -904,7 +904,9 @@ SQL
 
 backup_awg_database() {
     local backup_dir="/root/3ax-ui-backups"
-    local backup_file="$backup_dir/x-ui-before-awg-mobile-$(date -u +%Y%m%dT%H%M%SZ).db"
+    local backup_file
+
+    backup_file="$backup_dir/x-ui-before-awg-mobile-$(date -u +%Y%m%dT%H%M%SZ).db"
 
     mkdir -p "$backup_dir"
     chmod 700 "$backup_dir"
