@@ -8,6 +8,9 @@ readonly XUI_DB="/etc/x-ui/x-ui.db"
 readonly CREDENTIALS_FILE="/root/3ax-ui-credentials.txt"
 readonly STATE_FILE="/root/.3ax-ui-installer-state"
 readonly AWG_CONFIG_DIR="/etc/amnezia/amneziawg"
+readonly DEFAULT_AWG_PORT="30526"
+readonly AWG_IPV4_INSERT_TRIGGER="trg_3ax_ipv4_only_client_routes_insert"
+readonly AWG_IPV4_UPDATE_TRIGGER="trg_3ax_ipv4_only_client_routes_update"
 readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
 readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
 readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
@@ -820,6 +823,224 @@ open_firewall_port() {
     fi
 }
 
+sqlite3_clean() {
+    sqlite3 -init /dev/null -batch -noheader "$@"
+}
+
+valid_udp_port() {
+    [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]
+}
+
+udp_port_in_use() {
+    local port="$1"
+
+    ss -H -lun 2>/dev/null | grep -Eq "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)"
+}
+
+choose_mobile_awg_port() {
+    local current_port="${1:-}"
+    local requested="${AWG_PORT:-}"
+    local candidate
+    local random_hex
+    local attempt
+
+    if [[ -n "$requested" ]]; then
+        valid_udp_port "$requested" || die "AWG_PORT must be between 1 and 65535."
+        if [[ "$requested" != "$current_port" ]] && udp_port_in_use "$requested"; then
+            die "UDP port $requested is already in use."
+        fi
+        printf '%s\n' "$requested"
+        return
+    fi
+
+    if [[ "$DEFAULT_AWG_PORT" == "$current_port" ]] || ! udp_port_in_use "$DEFAULT_AWG_PORT"; then
+        printf '%s\n' "$DEFAULT_AWG_PORT"
+        return
+    fi
+
+    # Keep the automatic fallback out of the high ephemeral range. Some mobile
+    # networks silently discard UDP destinations near the top of 1..65535.
+    for ((attempt = 0; attempt < 128; attempt++)); do
+        random_hex="$(openssl rand -hex 2)"
+        candidate=$((20000 + (16#$random_hex % 20000)))
+        if [[ "$candidate" == "$current_port" ]] || ! udp_port_in_use "$candidate"; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    return 1
+}
+
+write_awg_ipv4_client_compatibility_sql() {
+    cat <<SQL
+CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_INSERT_TRIGGER
+AFTER INSERT ON awg_clients
+WHEN COALESCE(trim(NEW.ipv6_address), '') = ''
+ AND EXISTS (
+     SELECT 1 FROM awg_servers
+     WHERE id = NEW.server_id AND COALESCE(ipv6_enabled, 0) = 0
+ )
+ AND lower(replace(COALESCE(NEW.client_allowed_ips, ''), ' ', ''))
+     IN ('0.0.0.0/0,::/0', '::/0,0.0.0.0/0')
+BEGIN
+    UPDATE awg_clients SET client_allowed_ips = '0.0.0.0/0' WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_UPDATE_TRIGGER
+AFTER UPDATE OF client_allowed_ips, ipv6_address, server_id ON awg_clients
+WHEN COALESCE(trim(NEW.ipv6_address), '') = ''
+ AND EXISTS (
+     SELECT 1 FROM awg_servers
+     WHERE id = NEW.server_id AND COALESCE(ipv6_enabled, 0) = 0
+ )
+ AND lower(replace(COALESCE(NEW.client_allowed_ips, ''), ' ', ''))
+     IN ('0.0.0.0/0,::/0', '::/0,0.0.0.0/0')
+BEGIN
+    UPDATE awg_clients SET client_allowed_ips = '0.0.0.0/0' WHERE id = NEW.id;
+END;
+SQL
+}
+
+backup_awg_database() {
+    local backup_dir="/root/3ax-ui-backups"
+    local backup_file="$backup_dir/x-ui-before-awg-mobile-$(date -u +%Y%m%dT%H%M%SZ).db"
+
+    mkdir -p "$backup_dir"
+    chmod 700 "$backup_dir"
+    sqlite3_clean "$XUI_DB" ".backup '$backup_file'"
+    chmod 600 "$backup_file"
+    printf '%s\n' "$backup_file"
+}
+
+restore_awg_database() {
+    local backup_file="$1"
+
+    systemctl stop x-ui.service >/dev/null 2>&1 || true
+    install -m 0600 "$backup_file" "$XUI_DB"
+    systemctl start x-ui.service >/dev/null 2>&1 || true
+}
+
+configure_ipv4_forwarding() {
+    local sysctl_file="/etc/sysctl.d/90-3ax-ui-awg-forwarding.conf"
+
+    printf '%s\n' 'net.ipv4.ip_forward = 1' > "$sysctl_file"
+    chmod 644 "$sysctl_file"
+    sysctl -q -w net.ipv4.ip_forward=1
+}
+
+configure_awg_mobile_compatibility() {
+    local server_row
+    local server_id
+    local enabled
+    local interface_name
+    local current_port
+    local client_count
+    local desired_port
+    local route_repairs
+    local trigger_count
+    local backup_file=""
+    local config_file
+    local sql
+    local changed=0
+
+    [[ -s "$XUI_DB" ]] || return
+    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_servers';" 2>/dev/null)" == "1" ]] || return
+    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_clients';" 2>/dev/null)" == "1" ]] || return
+
+    server_row="$(sqlite3_clean -separator '|' "$XUI_DB" \
+        "SELECT id, CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port, (SELECT count(*) FROM awg_clients WHERE server_id = awg_servers.id) FROM awg_servers ORDER BY id LIMIT 1;" \
+        2>/dev/null || true)"
+    [[ -n "$server_row" ]] || return
+    IFS='|' read -r server_id enabled interface_name current_port client_count <<< "$server_row"
+
+    [[ "$server_id" =~ ^[0-9]+$ && "$server_id" -ge 1 ]] || die "The AmneziaWG server has an invalid database ID."
+    [[ "$enabled" == "0" || "$enabled" == "1" ]] || die "The AmneziaWG server has an invalid enabled state."
+    [[ "$client_count" =~ ^[0-9]+$ ]] || die "The AmneziaWG client count is invalid."
+    valid_awg_interface_name "$interface_name" || die "The AmneziaWG server has an unsafe interface name."
+    valid_udp_port "$current_port" || die "The AmneziaWG server has an invalid UDP listen port."
+
+    desired_port="$current_port"
+    if [[ -n "${AWG_PORT:-}" ]]; then
+        desired_port="$(choose_mobile_awg_port "$current_port")"
+    elif [[ "$enabled" == "0" && "$client_count" == "0" ]]; then
+        desired_port="$(choose_mobile_awg_port "$current_port")" || \
+            die "Cannot find a mobile-compatible UDP port for AmneziaWG."
+    fi
+
+    if [[ "$desired_port" != "$current_port" && ( "$enabled" == "1" || "$client_count" != "0" ) && "${AWG_RECONFIGURE_EXISTING:-0}" != "1" ]]; then
+        die "Changing an existing AmneziaWG port requires AWG_RECONFIGURE_EXISTING=1; clients must re-import their configs."
+    fi
+
+    route_repairs="$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM awg_clients c JOIN awg_servers s ON s.id=c.server_id WHERE COALESCE(s.ipv6_enabled,0)=0 AND COALESCE(trim(c.ipv6_address),'')='' AND lower(replace(COALESCE(c.client_allowed_ips,''),' ','')) IN ('0.0.0.0/0,::/0','::/0,0.0.0.0/0');")"
+    trigger_count="$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('$AWG_IPV4_INSERT_TRIGGER','$AWG_IPV4_UPDATE_TRIGGER');")"
+
+    if [[ "$desired_port" != "$current_port" || "$route_repairs" != "0" || "$trigger_count" != "2" ]]; then
+        backup_file="$(backup_awg_database)" || die "Cannot back up the 3AX-UI database before AWG compatibility changes."
+    fi
+
+    if [[ "$desired_port" != "$current_port" && "$enabled" == "1" ]]; then
+        systemctl stop x-ui.service || die "Cannot stop x-ui.service for the requested AWG port change."
+        config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+        if awg show "$interface_name" >/dev/null 2>&1; then
+            if ! awg-quick down "$config_file" >/dev/null 2>&1; then
+                systemctl start x-ui.service >/dev/null 2>&1 || true
+                die "Cannot stop the existing AmneziaWG interface safely; its port was not changed."
+            fi
+        fi
+    fi
+
+    sql="$(write_awg_ipv4_client_compatibility_sql)"
+    sql+=$'\n'
+    sql+="UPDATE awg_clients SET client_allowed_ips='0.0.0.0/0' WHERE id IN (SELECT c.id FROM awg_clients c JOIN awg_servers s ON s.id=c.server_id WHERE COALESCE(s.ipv6_enabled,0)=0 AND COALESCE(trim(c.ipv6_address),'')='' AND lower(replace(COALESCE(c.client_allowed_ips,''),' ','')) IN ('0.0.0.0/0,::/0','::/0,0.0.0.0/0'));"
+    if [[ "$desired_port" != "$current_port" ]]; then
+        sql+=$'\n'
+        sql+="UPDATE awg_servers SET listen_port=$desired_port WHERE id=$server_id; UPDATE inbounds SET port=$desired_port WHERE protocol='amneziawg';"
+    fi
+
+    if ! sqlite3_clean "$XUI_DB" "BEGIN IMMEDIATE; $sql COMMIT;"; then
+        if [[ -n "$backup_file" ]]; then
+            restore_awg_database "$backup_file"
+        fi
+        die "Cannot apply AmneziaWG mobile compatibility settings; the database was restored."
+    fi
+
+    configure_ipv4_forwarding
+    open_firewall_port "$desired_port" udp
+
+    if [[ "$desired_port" != "$current_port" ]]; then
+        changed=1
+        if [[ "$enabled" == "1" ]]; then
+            systemctl start x-ui.service || {
+                restore_awg_database "$backup_file"
+                die "x-ui.service failed after the AWG port change; the database was restored."
+            }
+            for _ in {1..20}; do
+                if awg show "$interface_name" >/dev/null 2>&1 && verify_awg_listen_port "$interface_name" "$desired_port"; then
+                    break
+                fi
+                sleep 1
+            done
+            if ! awg show "$interface_name" >/dev/null 2>&1 || ! verify_awg_listen_port "$interface_name" "$desired_port"; then
+                restore_awg_database "$backup_file"
+                die "AmneziaWG did not restart on UDP $desired_port; the database was restored."
+            fi
+        fi
+        info "AmneziaWG uses mobile-compatible UDP port $desired_port"
+    fi
+
+    if [[ "$route_repairs" != "0" ]]; then
+        changed=1
+        warn "$route_repairs IPv4-only AWG client profile(s) were corrected; export and import them again on the devices."
+    fi
+    if [[ "$changed" == "0" ]]; then
+        info "AmneziaWG mobile client defaults are compatible"
+    fi
+    if [[ -n "$backup_file" ]]; then
+        printf 'AWG compatibility backup: %s\n' "$backup_file"
+    fi
+}
+
 valid_awg_interface_name() {
     [[ "$1" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]
 }
@@ -848,7 +1069,7 @@ ensure_enabled_awg_runtime() {
         systemctl restart x-ui.service || die "x-ui.service could not be started."
     fi
 
-    server_row="$(sqlite3 -separator '|' "$XUI_DB" \
+    server_row="$(sqlite3_clean -separator '|' "$XUI_DB" \
         "SELECT CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port FROM awg_servers ORDER BY id LIMIT 1;" \
         2>/dev/null || true)"
     [[ -n "$server_row" ]] || return
@@ -1062,6 +1283,7 @@ main() {
     install_amneziawg_stack
 
     if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
+        configure_awg_mobile_compatibility
         ensure_enabled_awg_runtime
         print_credentials
         exit 0
@@ -1075,6 +1297,7 @@ main() {
     configure_renewal
     configure_panel
     verify_panel
+    configure_awg_mobile_compatibility
     ensure_enabled_awg_runtime
     save_credentials
     print_credentials

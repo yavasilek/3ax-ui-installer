@@ -58,6 +58,58 @@ valid_awg_interface_name awg-test.1
 assert_fails valid_awg_interface_name 'awg interface'
 assert_fails valid_awg_interface_name 'this-interface-name-is-too-long'
 
+valid_udp_port 30526
+valid_udp_port 443
+valid_udp_port 65535
+assert_fails valid_udp_port 0
+assert_fails valid_udp_port 65536
+assert_fails valid_udp_port invalid
+
+awg_compatibility_sql="$(write_awg_ipv4_client_compatibility_sql)"
+grep -Fq "CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_INSERT_TRIGGER" <<< "$awg_compatibility_sql"
+grep -Fq "CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_UPDATE_TRIGGER" <<< "$awg_compatibility_sql"
+grep -Fq "client_allowed_ips = '0.0.0.0/0'" <<< "$awg_compatibility_sql"
+grep -Fq "COALESCE(ipv6_enabled, 0) = 0" <<< "$awg_compatibility_sql"
+[[ "$(AWG_PORT=443 choose_mobile_awg_port 443)" == "443" ]]
+
+python_bin=""
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sqlite3' >/dev/null 2>&1; then
+    python_bin="python3"
+elif command -v python >/dev/null 2>&1 && python -c 'import sqlite3' >/dev/null 2>&1; then
+    python_bin="python"
+fi
+if [[ -n "$python_bin" ]]; then
+    AWG_COMPATIBILITY_SQL="$awg_compatibility_sql" "$python_bin" - <<'PY'
+import os
+import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.executescript(
+    """
+    CREATE TABLE awg_servers (id INTEGER PRIMARY KEY, ipv6_enabled numeric);
+    CREATE TABLE awg_clients (
+        id INTEGER PRIMARY KEY,
+        server_id INTEGER,
+        ipv6_address TEXT,
+        client_allowed_ips TEXT
+    );
+    """
+)
+db.executescript(os.environ["AWG_COMPATIBILITY_SQL"])
+db.execute("INSERT INTO awg_servers VALUES (1, 0)")
+db.execute("INSERT INTO awg_servers VALUES (2, 1)")
+db.execute("INSERT INTO awg_clients VALUES (1, 1, '', '0.0.0.0/0, ::/0')")
+db.execute("INSERT INTO awg_clients VALUES (2, 2, '2001:db8::2/128', '0.0.0.0/0, ::/0')")
+ipv4_only = db.execute("SELECT client_allowed_ips FROM awg_clients WHERE id=1").fetchone()[0]
+dual_stack = db.execute("SELECT client_allowed_ips FROM awg_clients WHERE id=2").fetchone()[0]
+assert ipv4_only == "0.0.0.0/0", ipv4_only
+assert dual_stack == "0.0.0.0/0, ::/0", dual_stack
+db.execute("UPDATE awg_clients SET client_allowed_ips='::/0, 0.0.0.0/0' WHERE id=1")
+ipv4_only = db.execute("SELECT client_allowed_ips FROM awg_clients WHERE id=1").fetchone()[0]
+assert ipv4_only == "0.0.0.0/0", ipv4_only
+PY
+fi
+
 awg_smoke_config="$(write_awg_smoke_config test-private-key eth0 awg3axtest)"
 grep -Fxq 'H1 = 5-1005' <<< "$awg_smoke_config"
 grep -Fxq 'I1 = <r 32>' <<< "$awg_smoke_config"
