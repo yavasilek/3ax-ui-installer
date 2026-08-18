@@ -23,6 +23,21 @@ valid_domain "vpn.example.com"
 assert_fails valid_domain "https://vpn.example.com"
 assert_fails valid_domain "bad_domain.example.com"
 
+[[ "$(select_amnezia_ppa_suite debian 11)" == "focal" ]]
+[[ "$(select_amnezia_ppa_suite debian 12)" == "jammy" ]]
+[[ "$(select_amnezia_ppa_suite debian 13)" == "noble" ]]
+[[ "$(select_amnezia_ppa_suite ubuntu 22.04)" == "jammy" ]]
+[[ "$(select_amnezia_ppa_suite ubuntu 24.04)" == "noble" ]]
+
+legacy_sources=$'deb https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main\ndeb http://deb.debian.org/debian trixie main\n'
+sanitized_sources="$(strip_legacy_amnezia_source_lines <<< "$legacy_sources")"
+[[ "$sanitized_sources" == 'deb http://deb.debian.org/debian trixie main' ]]
+
+repository_definition="$(write_amnezia_repository_definition noble amd64)"
+grep -Fxq 'Suites: noble' <<< "$repository_definition"
+grep -Fxq 'Architectures: amd64' <<< "$repository_definition"
+grep -Fxq "Signed-By: $AMNEZIA_PPA_KEYRING" <<< "$repository_definition"
+
 normalized_ports="$(printf '%s\n' 2222 22 invalid 22 0 65535 65536 | normalize_ssh_ports)"
 [[ "$normalized_ports" == "22,2222,65535" ]]
 
@@ -34,6 +49,9 @@ mapfile -t parsed_audit_packages < <(audit_package_names <<< "$audit_fixture")
 audit_fixture=$'The following packages are only half configured:\n grub-pc              GRand Unified Bootloader\n linux-image-test     Linux image\n'
 mapfile -t parsed_audit_packages < <(audit_package_names <<< "$audit_fixture")
 [[ ${#parsed_audit_packages[@]} -eq 2 ]]
+
+audit_packages_are_amneziawg amneziawg-dkms amneziawg-tools
+assert_fails audit_packages_are_amneziawg amneziawg-dkms grub-pc
 
 mock_bin="$(mktemp -d)"
 cleanup() {

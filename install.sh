@@ -6,9 +6,13 @@ readonly UPSTREAM_INSTALL_URL="https://raw.githubusercontent.com/coinman-dev/3ax
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
 readonly CREDENTIALS_FILE="/root/3ax-ui-credentials.txt"
 readonly STATE_FILE="/root/.3ax-ui-installer-state"
+readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
+readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
+readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
 
 UPSTREAM_SCRIPT=""
 UPSTREAM_LOG=""
+AWG_REPAIR_PENDING=0
 
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -86,6 +90,7 @@ install_prerequisites() {
         missing_packages+=(iproute2)
     fi
     command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+    command -v gpg >/dev/null 2>&1 || missing_packages+=(gnupg)
     command -v fail2ban-client >/dev/null 2>&1 || missing_packages+=(fail2ban)
     command -v nft >/dev/null 2>&1 || missing_packages+=(nftables)
     if ! dpkg-query -W -f='${Status}' python3-systemd 2>/dev/null | grep -q 'ok installed'; then
@@ -102,6 +107,184 @@ install_prerequisites() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q "${missing_packages[@]}"
+}
+
+select_amnezia_ppa_suite() {
+    local os_id="${1:-${ID:-}}"
+    local version="${2:-${VERSION_ID:-}}"
+    local major="${version%%.*}"
+
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+
+    case "$os_id" in
+        debian)
+            if [[ "$major" -ge 13 ]]; then
+                printf 'noble\n'
+            elif [[ "$major" -eq 12 ]]; then
+                printf 'jammy\n'
+            else
+                printf 'focal\n'
+            fi
+            ;;
+        ubuntu)
+            if [[ "$major" -ge 24 ]]; then
+                printf 'noble\n'
+            else
+                printf 'jammy\n'
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+strip_legacy_amnezia_source_lines() {
+    sed '\#ppa.launchpadcontent.net/amnezia/ppa/ubuntu#d'
+}
+
+sanitize_legacy_amnezia_sources() {
+    local source_file
+    local temp_file
+    local backup_dir=""
+    local -a source_files=(/etc/apt/sources.list)
+
+    shopt -s nullglob
+    source_files+=(/etc/apt/sources.list.d/*.list)
+    shopt -u nullglob
+
+    for source_file in "${source_files[@]}"; do
+        [[ -f "$source_file" ]] || continue
+        grep -q 'ppa.launchpadcontent.net/amnezia/ppa/ubuntu' "$source_file" || continue
+
+        if [[ -z "$backup_dir" ]]; then
+            backup_dir="$(mktemp -d /root/3ax-ui-amnezia-source-backup.XXXXXX)"
+            chmod 700 "$backup_dir"
+        fi
+        cp -a -- "$source_file" "$backup_dir/$(basename "$source_file")"
+
+        temp_file="$(mktemp "$(dirname "$source_file")/.3ax-ui-amnezia.XXXXXX")"
+        strip_legacy_amnezia_source_lines < "$source_file" > "$temp_file"
+        chown --reference="$source_file" "$temp_file"
+        chmod --reference="$source_file" "$temp_file"
+        mv -f -- "$temp_file" "$source_file"
+    done
+
+    if [[ -n "$backup_dir" ]]; then
+        info "Replaced legacy Amnezia PPA entries (backup: $backup_dir)"
+    fi
+}
+
+write_amnezia_repository_definition() {
+    local suite="$1"
+    local architecture="$2"
+
+    printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu' \
+        "Suites: $suite" \
+        'Components: main' \
+        "Architectures: $architecture" \
+        "Signed-By: $AMNEZIA_PPA_KEYRING"
+}
+
+configure_amnezia_repository() {
+    local suite
+    local architecture
+    local key_file
+    local keyring_file
+    local source_file
+    local fingerprint
+
+    suite="$(select_amnezia_ppa_suite)" || die "Cannot select an AmneziaWG package repository."
+    architecture="$(dpkg --print-architecture)"
+    [[ "$architecture" == "amd64" || "$architecture" == "arm64" ]] || \
+        die "The AmneziaWG repository does not support architecture $architecture."
+
+    key_file="$(mktemp /tmp/3ax-ui-amnezia-key.XXXXXX)"
+    keyring_file="$(mktemp /tmp/3ax-ui-amnezia-keyring.XXXXXX)"
+    source_file="$(mktemp /tmp/3ax-ui-amnezia-source.XXXXXX)"
+
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${AMNEZIA_PPA_FINGERPRINT}" \
+        -o "$key_file"; then
+        rm -f -- "$key_file" "$keyring_file" "$source_file"
+        die "Cannot download the official Amnezia PPA signing key."
+    fi
+
+    fingerprint="$(gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null \
+        | awk -F: '$1 == "fpr" {print toupper($10); exit}')"
+    if [[ "$fingerprint" != "$AMNEZIA_PPA_FINGERPRINT" ]]; then
+        rm -f -- "$key_file" "$keyring_file" "$source_file"
+        die "The downloaded Amnezia PPA signing key has an unexpected fingerprint."
+    fi
+
+    gpg --batch --yes --dearmor --output "$keyring_file" "$key_file"
+    write_amnezia_repository_definition "$suite" "$architecture" > "$source_file"
+    install -m 0644 "$keyring_file" "$AMNEZIA_PPA_KEYRING"
+    install -m 0644 "$source_file" "$AMNEZIA_PPA_SOURCE"
+    rm -f -- "$key_file" "$keyring_file" "$source_file"
+
+    info "Configured the signed Amnezia PPA ($suite, $architecture)"
+}
+
+amneziawg_is_ready() {
+    local private_key
+    local public_key
+    local test_interface="awg3ax$$"
+
+    command -v awg >/dev/null 2>&1 || return 1
+    command -v awg-quick >/dev/null 2>&1 || return 1
+    modprobe amneziawg >/dev/null 2>&1 || return 1
+
+    private_key="$(awg genkey 2>/dev/null)"
+    [[ -n "$private_key" ]] || return 1
+    public_key="$(printf '%s\n' "$private_key" | awg pubkey 2>/dev/null)"
+    [[ -n "$public_key" ]] || return 1
+
+    if ! ip link add "$test_interface" type amneziawg >/dev/null 2>&1; then
+        return 1
+    fi
+    ip link del "$test_interface" >/dev/null 2>&1 || true
+}
+
+install_amneziawg_stack() {
+    local kernel_version
+    local headers_package
+
+    if amneziawg_is_ready; then
+        info "AmneziaWG tools and kernel module are already working"
+        return
+    fi
+
+    command -v curl >/dev/null 2>&1 || die "curl is required to repair AmneziaWG."
+    command -v gpg >/dev/null 2>&1 || die "gpg is required to repair AmneziaWG."
+
+    sanitize_legacy_amnezia_sources
+    configure_amnezia_repository
+
+    kernel_version="$(uname -r)"
+    headers_package="linux-headers-${kernel_version}"
+    info "Installing AmneziaWG tools and DKMS module for kernel $kernel_version"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y -q --reinstall \
+        build-essential \
+        dkms \
+        "$headers_package" \
+        amneziawg \
+        amneziawg-dkms \
+        amneziawg-tools
+
+    dkms autoinstall -k "$kernel_version"
+    depmod -a "$kernel_version"
+    printf 'amneziawg\n' > /etc/modules-load.d/amneziawg.conf
+
+    if ! amneziawg_is_ready; then
+        dkms status >&2 || true
+        modinfo amneziawg >&2 || true
+        die "AmneziaWG was installed but its tools or kernel module did not pass the runtime test."
+    fi
+
+    info "AmneziaWG tools and kernel module passed the runtime test"
 }
 
 normalize_ssh_ports() {
@@ -269,6 +452,18 @@ audit_package_names() {
     awk '/^ [[:alnum:]][^[:space:]]*[[:space:]]/ {print $1}'
 }
 
+audit_packages_are_amneziawg() {
+    local package
+
+    [[ $# -gt 0 ]] || return 1
+    for package in "$@"; do
+        case "$package" in
+            amneziawg|amneziawg-dkms|amneziawg-tools) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
 detect_grub_install_disk() {
     local boot_device
     local boot_real
@@ -371,13 +566,16 @@ check_package_manager_health() {
         mapfile -t audit_packages < <(audit_package_names <<< "$audit_output")
         if [[ ${#audit_packages[@]} -eq 1 && "${audit_packages[0]}" == "grub-pc" ]]; then
             repair_unfinished_grub
+        elif audit_packages_are_amneziawg "${audit_packages[@]}"; then
+            AWG_REPAIR_PENDING=1
+            warn "An unfinished AmneziaWG package installation will be repaired automatically."
         else
             printf '%s\n' "$audit_output" >&2
             die "dpkg contains unfinished packages that cannot be repaired safely by this installer."
         fi
     fi
 
-    if ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then
+    if [[ "$AWG_REPAIR_PENDING" -eq 0 ]] && ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then
         printf '%s\n' "$apt_check_output" >&2
         die "APT dependency checks failed. Repair APT/dpkg before installing 3AX-UI."
     fi
@@ -566,10 +764,8 @@ install_upstream_panel() {
 
 verify_amneziawg() {
     info "Checking AmneziaWG support"
-    command -v awg >/dev/null 2>&1 || \
-        die "The awg utility is missing. See the upstream installation log and rerun this installer."
-    modprobe amneziawg >/dev/null 2>&1 || \
-        die "The AmneziaWG kernel module cannot be loaded. Check DKMS and Secure Boot, then rerun."
+    amneziawg_is_ready || \
+        die "The AmneziaWG tools or kernel module failed the final runtime test."
 }
 
 obtain_certificate() {
@@ -681,15 +877,26 @@ main() {
     require_root
     load_os
     check_package_manager_health
+
+    if [[ "$AWG_REPAIR_PENDING" -eq 1 ]]; then
+        install_amneziawg_stack
+        AWG_REPAIR_PENDING=0
+        check_package_manager_health
+        [[ "$AWG_REPAIR_PENDING" -eq 0 ]] || \
+            die "dpkg still contains unfinished AmneziaWG packages after repair."
+    fi
+
+    sanitize_legacy_amnezia_sources
     install_prerequisites
+    validate_host
     configure_fail2ban_ssh
+    install_amneziawg_stack
 
     if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
         print_credentials
         exit 0
     fi
 
-    validate_host
     load_or_create_state
     verify_dns
     install_upstream_panel
