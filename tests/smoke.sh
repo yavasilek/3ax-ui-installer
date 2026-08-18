@@ -23,6 +23,9 @@ valid_domain "vpn.example.com"
 assert_fails valid_domain "https://vpn.example.com"
 assert_fails valid_domain "bad_domain.example.com"
 
+normalized_ports="$(printf '%s\n' 2222 22 invalid 22 0 65535 65536 | normalize_ssh_ports)"
+[[ "$normalized_ports" == "22,2222,65535" ]]
+
 audit_fixture=$'The following packages are only half configured:\n grub-pc              GRand Unified Bootloader\n'
 mapfile -t parsed_audit_packages < <(audit_package_names <<< "$audit_fixture")
 [[ ${#parsed_audit_packages[@]} -eq 1 ]]

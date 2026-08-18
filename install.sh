@@ -86,6 +86,11 @@ install_prerequisites() {
         missing_packages+=(iproute2)
     fi
     command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+    command -v fail2ban-client >/dev/null 2>&1 || missing_packages+=(fail2ban)
+    command -v nft >/dev/null 2>&1 || missing_packages+=(nftables)
+    if ! dpkg-query -W -f='${Status}' python3-systemd 2>/dev/null | grep -q 'ok installed'; then
+        missing_packages+=(python3-systemd)
+    fi
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_packages+=(ca-certificates)
 
     if [[ ${#missing_packages[@]} -eq 0 ]]; then
@@ -97,6 +102,114 @@ install_prerequisites() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q "${missing_packages[@]}"
+}
+
+normalize_ssh_ports() {
+    awk '$1 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 {print $1}' \
+        | sort -nu \
+        | paste -sd, -
+}
+
+detect_ssh_ports() {
+    {
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            awk '{print $4}' <<< "$SSH_CONNECTION"
+        fi
+
+        if command -v sshd >/dev/null 2>&1; then
+            sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
+        fi
+
+        if command -v ss >/dev/null 2>&1; then
+            ss -H -ltnp 2>/dev/null | awk '
+                /"sshd"/ {
+                    address = $4
+                    sub(/^.*:/, "", address)
+                    print address
+                }
+            ' || true
+        fi
+    } | normalize_ssh_ports
+}
+
+restore_fail2ban_jail() {
+    local jail_file="$1"
+    local backup_file="$2"
+
+    if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+        cp -a -- "$backup_file" "$jail_file"
+    else
+        rm -f -- "$jail_file"
+    fi
+}
+
+configure_fail2ban_ssh() {
+    local ssh_ports
+    local jail_file="/etc/fail2ban/jail.d/3ax-ui-ssh.local"
+    local temp_file
+    local backup_file=""
+    local config_output
+
+    ssh_ports="$(detect_ssh_ports)"
+    [[ -n "$ssh_ports" ]] || die "Cannot determine the SSH port for Fail2Ban."
+
+    temp_file="$(mktemp /tmp/3ax-ui-fail2ban.XXXXXX)"
+    chmod 600 "$temp_file"
+    {
+        printf '%s\n' \
+            '[sshd]' \
+            'enabled = true' \
+            'backend = systemd' \
+            'mode = normal' \
+            "port = $ssh_ports" \
+            'maxretry = 5' \
+            'findtime = 10m' \
+            'bantime = 1h' \
+            'bantime.increment = true' \
+            'bantime.maxtime = 1d' \
+            'usedns = no' \
+            'banaction = nftables[type=multiport]'
+    } > "$temp_file"
+
+    mkdir -p /etc/fail2ban/jail.d
+    if [[ -f "$jail_file" ]]; then
+        backup_file="$(mktemp /tmp/3ax-ui-fail2ban-backup.XXXXXX)"
+        cp -a -- "$jail_file" "$backup_file"
+    fi
+    install -m 0644 "$temp_file" "$jail_file"
+    rm -f -- "$temp_file"
+
+    if ! config_output="$(fail2ban-client -t 2>&1)"; then
+        restore_fail2ban_jail "$jail_file" "$backup_file"
+        rm -f -- "$backup_file"
+        printf '%s\n' "$config_output" >&2
+        die "Fail2Ban rejected the generated SSH jail; the previous configuration was restored."
+    fi
+
+    if ! systemctl enable fail2ban.service >/dev/null 2>&1 || \
+        ! systemctl restart fail2ban.service >/dev/null 2>&1; then
+        restore_fail2ban_jail "$jail_file" "$backup_file"
+        rm -f -- "$backup_file"
+        systemctl restart fail2ban.service >/dev/null 2>&1 || true
+        systemctl status --no-pager fail2ban.service >&2 || true
+        die "Fail2Ban could not start; the previous configuration was restored."
+    fi
+
+    for _ in {1..20}; do
+        if fail2ban-client ping >/dev/null 2>&1 && \
+            fail2ban-client status sshd >/dev/null 2>&1; then
+            rm -f -- "$backup_file"
+            info "Fail2Ban protects SSH on port(s): $ssh_ports"
+            return
+        fi
+        sleep 1
+    done
+
+    restore_fail2ban_jail "$jail_file" "$backup_file"
+    rm -f -- "$backup_file"
+    systemctl restart fail2ban.service >/dev/null 2>&1 || true
+    journalctl -u fail2ban.service -n 30 --no-pager >&2 || true
+    die "The Fail2Ban sshd jail did not become active; the previous configuration was restored."
 }
 
 print_disk_diagnostics() {
@@ -566,15 +679,16 @@ print_credentials() {
 
 main() {
     require_root
+    load_os
+    check_package_manager_health
+    install_prerequisites
+    configure_fail2ban_ssh
 
     if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
         print_credentials
         exit 0
     fi
 
-    load_os
-    check_package_manager_health
-    install_prerequisites
     validate_host
     load_or_create_state
     verify_dns
