@@ -78,10 +78,61 @@ load_os() {
 }
 
 install_prerequisites() {
-    info "Installing prerequisites"
+    local -a missing_packages=()
+
+    command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+    command -v certbot >/dev/null 2>&1 || missing_packages+=(certbot)
+    if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+        missing_packages+=(iproute2)
+    fi
+    command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_packages+=(ca-certificates)
+
+    if [[ ${#missing_packages[@]} -eq 0 ]]; then
+        info "Prerequisites are already installed"
+        return
+    fi
+
+    info "Installing prerequisites: ${missing_packages[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
-    apt-get install -y -q ca-certificates certbot curl iproute2 openssl
+    apt-get install -y -q "${missing_packages[@]}"
+}
+
+print_disk_diagnostics() {
+    printf '\nRead-only disk diagnostics:\n' >&2
+    printf 'Root filesystem: ' >&2
+    findmnt -no SOURCE / 2>/dev/null >&2 || printf 'unknown\n' >&2
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL 2>/dev/null >&2 || true
+}
+
+check_package_manager_health() {
+    local audit_output
+    local apt_check_output
+
+    audit_output="$(LC_ALL=C dpkg --audit 2>&1 || true)"
+    if [[ -n "$audit_output" ]]; then
+        printf '%s\n' "$audit_output" >&2
+        print_disk_diagnostics
+
+        if grep -qw 'grub-pc' <<< "$audit_output"; then
+            printf '\nThe unfinished grub-pc setup must be repaired before installing 3AX-UI.\n' >&2
+            printf 'Do not guess the boot disk. Use the diagnostics above, then run:\n\n' >&2
+            printf '  DEBIAN_FRONTEND=dialog dpkg --configure grub-pc\n' >&2
+            printf '  dpkg --configure -a\n' >&2
+            printf '  dpkg --audit\n\n' >&2
+            printf 'In the GRUB dialog select the current whole boot disk, not a partition.\n' >&2
+        else
+            printf '\nRepair unfinished packages with dpkg --configure -a, then rerun this installer.\n' >&2
+        fi
+
+        die "The Debian package database contains unfinished packages."
+    fi
+
+    if ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then
+        printf '%s\n' "$apt_check_output" >&2
+        die "APT dependency checks failed. Repair APT/dpkg before installing 3AX-UI."
+    fi
 }
 
 validate_host() {
@@ -387,6 +438,7 @@ main() {
     fi
 
     load_os
+    check_package_manager_health
     install_prerequisites
     validate_host
     load_or_create_state
