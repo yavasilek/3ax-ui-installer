@@ -78,10 +78,107 @@ load_os() {
 }
 
 install_prerequisites() {
-    info "Installing prerequisites"
+    local -a missing_packages=()
+
+    command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+    command -v certbot >/dev/null 2>&1 || missing_packages+=(certbot)
+    if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+        missing_packages+=(iproute2)
+    fi
+    command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_packages+=(ca-certificates)
+
+    if [[ ${#missing_packages[@]} -eq 0 ]]; then
+        info "Prerequisites are already installed"
+        return
+    fi
+
+    info "Installing prerequisites: ${missing_packages[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
-    apt-get install -y -q ca-certificates certbot curl iproute2 openssl
+    apt-get install -y -q "${missing_packages[@]}"
+}
+
+print_disk_diagnostics() {
+    local root_source=""
+    local boot_device=""
+    local device_path
+    local device_name
+    local device_type
+    local sectors
+    local model
+
+    if command -v findmnt >/dev/null 2>&1; then
+        root_source="$(findmnt -no SOURCE / 2>/dev/null || true)"
+    fi
+    if [[ -z "$root_source" && -r /proc/self/mounts ]]; then
+        root_source="$(awk '$2 == "/" {print $1; exit}' /proc/self/mounts)"
+    fi
+    if command -v grub-probe >/dev/null 2>&1; then
+        boot_device="$(grub-probe --target=device /boot 2>/dev/null || true)"
+    fi
+
+    printf '\nRead-only disk diagnostics:\n' >&2
+    printf 'Root filesystem: %s\n' "${root_source:-unknown}" >&2
+    printf 'GRUB /boot device: %s\n' "${boot_device:-unknown}" >&2
+
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL >&2 || true
+    else
+        printf '\nBlock devices from /sys/class/block (size is in 512-byte sectors):\n' >&2
+        printf '%-16s %-10s %-14s %s\n' 'NAME' 'TYPE' 'SECTORS' 'MODEL' >&2
+        for device_path in /sys/class/block/*; do
+            [[ -e "$device_path" ]] || continue
+            device_name="${device_path##*/}"
+            if [[ -f "$device_path/partition" ]]; then
+                device_type="partition"
+            else
+                device_type="disk"
+            fi
+            sectors="$(cat "$device_path/size" 2>/dev/null || printf '?')"
+            model="$(tr -s ' ' < "$device_path/device/model" 2>/dev/null || true)"
+            printf '%-16s %-10s %-14s %s\n' "$device_name" "$device_type" "$sectors" "$model" >&2
+        done
+    fi
+
+    if [[ -d /dev/disk/by-id ]]; then
+        printf '\nCurrent /dev/disk/by-id links:\n' >&2
+        ls -l /dev/disk/by-id 2>/dev/null >&2 || true
+    fi
+
+    if command -v debconf-show >/dev/null 2>&1; then
+        printf '\nSaved grub-pc install-device setting:\n' >&2
+        debconf-show grub-pc 2>/dev/null | grep 'grub-pc/install_devices' >&2 || true
+    fi
+}
+
+check_package_manager_health() {
+    local audit_output
+    local apt_check_output
+
+    audit_output="$(LC_ALL=C dpkg --audit 2>&1 || true)"
+    if [[ -n "$audit_output" ]]; then
+        printf '%s\n' "$audit_output" >&2
+        print_disk_diagnostics
+
+        if grep -qw 'grub-pc' <<< "$audit_output"; then
+            printf '\nThe unfinished grub-pc setup must be repaired before installing 3AX-UI.\n' >&2
+            printf 'Do not guess the boot disk. Use the diagnostics above, then run:\n\n' >&2
+            printf '  DEBIAN_FRONTEND=dialog dpkg --configure grub-pc\n' >&2
+            printf '  dpkg --configure -a\n' >&2
+            printf '  dpkg --audit\n\n' >&2
+            printf 'In the GRUB dialog select the current whole boot disk, not a partition.\n' >&2
+        else
+            printf '\nRepair unfinished packages with dpkg --configure -a, then rerun this installer.\n' >&2
+        fi
+
+        die "The Debian package database contains unfinished packages."
+    fi
+
+    if ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then
+        printf '%s\n' "$apt_check_output" >&2
+        die "APT dependency checks failed. Repair APT/dpkg before installing 3AX-UI."
+    fi
 }
 
 validate_host() {
@@ -387,6 +484,7 @@ main() {
     fi
 
     load_os
+    check_package_manager_health
     install_prerequisites
     validate_host
     load_or_create_state

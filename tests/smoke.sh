@@ -23,4 +23,21 @@ valid_domain "vpn.example.com"
 assert_fails valid_domain "https://vpn.example.com"
 assert_fails valid_domain "bad_domain.example.com"
 
+mock_bin="$(mktemp -d)"
+cleanup() {
+    rm -rf -- "$mock_bin"
+}
+trap cleanup EXIT
+
+printf '%s\n' '#!/usr/bin/env bash' 'printf "unfinished grub-pc package\\n"' > "$mock_bin/dpkg"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$mock_bin/apt-get"
+chmod +x "$mock_bin/dpkg" "$mock_bin/apt-get"
+if (PATH="$mock_bin:$PATH" check_package_manager_health >/dev/null 2>&1); then
+    printf 'Expected package-manager health check to fail.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$mock_bin/dpkg"
+PATH="$mock_bin:$PATH" check_package_manager_health
+
 printf 'Smoke tests passed.\n'
