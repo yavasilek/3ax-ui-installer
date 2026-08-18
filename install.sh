@@ -4,11 +4,20 @@ set -Eeuo pipefail
 
 readonly UPSTREAM_INSTALL_URL="https://raw.githubusercontent.com/coinman-dev/3ax-ui/main/install.sh"
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
+readonly XUI_DB="/etc/x-ui/x-ui.db"
 readonly CREDENTIALS_FILE="/root/3ax-ui-credentials.txt"
 readonly STATE_FILE="/root/.3ax-ui-installer-state"
+readonly AWG_CONFIG_DIR="/etc/amnezia/amneziawg"
+readonly DEFAULT_AWG_PORT="30526"
+readonly AWG_IPV4_INSERT_TRIGGER="trg_3ax_ipv4_only_client_routes_insert"
+readonly AWG_IPV4_UPDATE_TRIGGER="trg_3ax_ipv4_only_client_routes_update"
+readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
+readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
+readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
 
 UPSTREAM_SCRIPT=""
 UPSTREAM_LOG=""
+AWG_REPAIR_PENDING=0
 
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -86,6 +95,15 @@ install_prerequisites() {
         missing_packages+=(iproute2)
     fi
     command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+    command -v gpg >/dev/null 2>&1 || missing_packages+=(gnupg)
+    command -v fail2ban-client >/dev/null 2>&1 || missing_packages+=(fail2ban)
+    command -v nft >/dev/null 2>&1 || missing_packages+=(nftables)
+    command -v iptables >/dev/null 2>&1 || missing_packages+=(iptables)
+    command -v sqlite3 >/dev/null 2>&1 || missing_packages+=(sqlite3)
+    command -v ndppd >/dev/null 2>&1 || missing_packages+=(ndppd)
+    if ! dpkg-query -W -f='${Status}' python3-systemd 2>/dev/null | grep -q 'ok installed'; then
+        missing_packages+=(python3-systemd)
+    fi
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_packages+=(ca-certificates)
 
     if [[ ${#missing_packages[@]} -eq 0 ]]; then
@@ -97,6 +115,379 @@ install_prerequisites() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q "${missing_packages[@]}"
+}
+
+select_amnezia_ppa_suite() {
+    local os_id="$1"
+    local version="$2"
+    local major="${version%%.*}"
+
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+
+    case "$os_id" in
+        debian)
+            if [[ "$major" -ge 13 ]]; then
+                printf 'noble\n'
+            elif [[ "$major" -eq 12 ]]; then
+                printf 'jammy\n'
+            else
+                printf 'focal\n'
+            fi
+            ;;
+        ubuntu)
+            if [[ "$major" -ge 24 ]]; then
+                printf 'noble\n'
+            else
+                printf 'jammy\n'
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+strip_legacy_amnezia_source_lines() {
+    sed '\#ppa.launchpadcontent.net/amnezia/ppa/ubuntu#d'
+}
+
+sanitize_legacy_amnezia_sources() {
+    local source_file
+    local temp_file
+    local backup_dir=""
+    local -a source_files=(/etc/apt/sources.list)
+
+    shopt -s nullglob
+    source_files+=(/etc/apt/sources.list.d/*.list)
+    shopt -u nullglob
+
+    for source_file in "${source_files[@]}"; do
+        [[ -f "$source_file" ]] || continue
+        grep -q 'ppa.launchpadcontent.net/amnezia/ppa/ubuntu' "$source_file" || continue
+
+        if [[ -z "$backup_dir" ]]; then
+            backup_dir="$(mktemp -d /root/3ax-ui-amnezia-source-backup.XXXXXX)"
+            chmod 700 "$backup_dir"
+        fi
+        cp -a -- "$source_file" "$backup_dir/$(basename "$source_file")"
+
+        temp_file="$(mktemp "$(dirname "$source_file")/.3ax-ui-amnezia.XXXXXX")"
+        strip_legacy_amnezia_source_lines < "$source_file" > "$temp_file"
+        chown --reference="$source_file" "$temp_file"
+        chmod --reference="$source_file" "$temp_file"
+        mv -f -- "$temp_file" "$source_file"
+    done
+
+    if [[ -n "$backup_dir" ]]; then
+        info "Replaced legacy Amnezia PPA entries (backup: $backup_dir)"
+    fi
+}
+
+write_amnezia_repository_definition() {
+    local suite="$1"
+    local architecture="$2"
+
+    printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu' \
+        "Suites: $suite" \
+        'Components: main' \
+        "Architectures: $architecture" \
+        "Signed-By: $AMNEZIA_PPA_KEYRING"
+}
+
+configure_amnezia_repository() {
+    local suite
+    local architecture
+    local key_file
+    local keyring_file
+    local source_file
+    local fingerprint
+
+    suite="$(select_amnezia_ppa_suite "${ID:-}" "${VERSION_ID:-}")" || \
+        die "Cannot select an AmneziaWG package repository."
+    architecture="$(dpkg --print-architecture)"
+    [[ "$architecture" == "amd64" || "$architecture" == "arm64" ]] || \
+        die "The AmneziaWG repository does not support architecture $architecture."
+
+    key_file="$(mktemp /tmp/3ax-ui-amnezia-key.XXXXXX)"
+    keyring_file="$(mktemp /tmp/3ax-ui-amnezia-keyring.XXXXXX)"
+    source_file="$(mktemp /tmp/3ax-ui-amnezia-source.XXXXXX)"
+
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${AMNEZIA_PPA_FINGERPRINT}" \
+        -o "$key_file"; then
+        rm -f -- "$key_file" "$keyring_file" "$source_file"
+        die "Cannot download the official Amnezia PPA signing key."
+    fi
+
+    fingerprint="$(gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null \
+        | awk -F: '$1 == "fpr" {print toupper($10); exit}')"
+    if [[ "$fingerprint" != "$AMNEZIA_PPA_FINGERPRINT" ]]; then
+        rm -f -- "$key_file" "$keyring_file" "$source_file"
+        die "The downloaded Amnezia PPA signing key has an unexpected fingerprint."
+    fi
+
+    gpg --batch --yes --dearmor --output "$keyring_file" "$key_file"
+    write_amnezia_repository_definition "$suite" "$architecture" > "$source_file"
+    install -m 0644 "$keyring_file" "$AMNEZIA_PPA_KEYRING"
+    install -m 0644 "$source_file" "$AMNEZIA_PPA_SOURCE"
+    rm -f -- "$key_file" "$keyring_file" "$source_file"
+
+    info "Configured the signed Amnezia PPA ($suite, $architecture)"
+}
+
+amneziawg_is_ready() {
+    local private_key
+    local public_key
+    local test_interface="awg3ax$$"
+
+    command -v awg >/dev/null 2>&1 || return 1
+    command -v awg-quick >/dev/null 2>&1 || return 1
+    modprobe amneziawg >/dev/null 2>&1 || return 1
+
+    private_key="$(awg genkey 2>/dev/null)"
+    [[ -n "$private_key" ]] || return 1
+    public_key="$(printf '%s\n' "$private_key" | awg pubkey 2>/dev/null)"
+    [[ -n "$public_key" ]] || return 1
+
+    if ! ip link add "$test_interface" type amneziawg >/dev/null 2>&1; then
+        return 1
+    fi
+    ip link del "$test_interface" >/dev/null 2>&1 || true
+}
+
+write_awg_smoke_config() {
+    local private_key="$1"
+    local external_interface="$2"
+    local test_interface="$3"
+
+    cat <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = 192.0.2.1/32
+MTU = 1420
+Jc = 4
+Jmin = 40
+Jmax = 90
+S1 = 56
+S2 = 88
+S3 = 12
+S4 = 8
+H1 = 5-1005
+H2 = 2005-3005
+H3 = 4005-5005
+H4 = 6005-7005
+I1 = <r 32>
+PostUp = iptables -w -t nat -A POSTROUTING -s 192.0.2.0/31 -o $external_interface -j MASQUERADE; iptables -w -A FORWARD -i $test_interface -j ACCEPT; iptables -w -A FORWARD -o $test_interface -j ACCEPT; sysctl -q -w net.ipv4.ip_forward=1
+PostDown = iptables -w -t nat -D POSTROUTING -s 192.0.2.0/31 -o $external_interface -j MASQUERADE; iptables -w -D FORWARD -i $test_interface -j ACCEPT; iptables -w -D FORWARD -o $test_interface -j ACCEPT
+EOF
+}
+
+cleanup_awg_smoke() {
+    local config_file="$1"
+    local test_interface="$2"
+    local external_interface="$3"
+    local test_dir
+
+    if [[ -s "$config_file" ]] && command -v awg-quick >/dev/null 2>&1; then
+        awg-quick down "$config_file" >/dev/null 2>&1 || true
+    fi
+    ip link del "$test_interface" >/dev/null 2>&1 || true
+    iptables -w -t nat -D POSTROUTING -s 192.0.2.0/31 -o "$external_interface" -j MASQUERADE >/dev/null 2>&1 || true
+    iptables -w -D FORWARD -i "$test_interface" -j ACCEPT >/dev/null 2>&1 || true
+    iptables -w -D FORWARD -o "$test_interface" -j ACCEPT >/dev/null 2>&1 || true
+    rm -f -- "$config_file"
+    test_dir="$(dirname "$config_file")"
+    rmdir -- "$test_dir" >/dev/null 2>&1 || true
+}
+
+amneziawg_server_smoke_test() {
+    local private_key
+    local external_interface
+    local test_interface="awg3ax$$"
+    local test_dir
+    local config_file
+    local output
+
+    command -v iptables >/dev/null 2>&1 || return 1
+    external_interface="$(ip -4 route show default 2>/dev/null | awk '$1 == "default" {print $5; exit}')"
+    [[ "$external_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+
+    private_key="$(awg genkey 2>/dev/null)"
+    [[ -n "$private_key" ]] || return 1
+    test_dir="$(mktemp -d /tmp/3ax-ui-awg-smoke.XXXXXX)"
+    config_file="$test_dir/$test_interface.conf"
+    write_awg_smoke_config "$private_key" "$external_interface" "$test_interface" > "$config_file"
+    chmod 600 "$config_file"
+
+    if ! output="$(awg-quick up "$config_file" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+        return 1
+    fi
+    if ! awg show "$test_interface" >/dev/null 2>&1; then
+        cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+        return 1
+    fi
+    if ! output="$(awg-quick down "$config_file" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+        return 1
+    fi
+
+    cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+}
+
+install_amneziawg_stack() {
+    local kernel_version
+    local headers_package
+
+    if [[ "$AWG_REPAIR_PENDING" -eq 0 ]] && \
+        amneziawg_is_ready && amneziawg_server_smoke_test; then
+        info "AmneziaWG passed the full AWG 2.0 server startup test"
+        return
+    fi
+
+    command -v curl >/dev/null 2>&1 || die "curl is required to repair AmneziaWG."
+    command -v gpg >/dev/null 2>&1 || die "gpg is required to repair AmneziaWG."
+
+    sanitize_legacy_amnezia_sources
+    configure_amnezia_repository
+
+    kernel_version="$(uname -r)"
+    headers_package="linux-headers-${kernel_version}"
+    info "Installing AmneziaWG tools and DKMS module for kernel $kernel_version"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y -q --reinstall \
+        build-essential \
+        dkms \
+        "$headers_package" \
+        iptables \
+        ndppd \
+        sqlite3 \
+        amneziawg \
+        amneziawg-dkms \
+        amneziawg-tools
+
+    dkms autoinstall -k "$kernel_version"
+    depmod -a "$kernel_version"
+    printf 'amneziawg\n' > /etc/modules-load.d/amneziawg.conf
+
+    if ! amneziawg_is_ready || ! amneziawg_server_smoke_test; then
+        dkms status >&2 || true
+        modinfo amneziawg >&2 || true
+        die "AmneziaWG was installed but a complete AWG 2.0 server could not be started."
+    fi
+
+    info "AmneziaWG passed the full AWG 2.0 server startup test"
+}
+
+normalize_ssh_ports() {
+    awk '$1 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 {print $1}' \
+        | sort -nu \
+        | paste -sd, -
+}
+
+detect_ssh_ports() {
+    {
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            awk '{print $4}' <<< "$SSH_CONNECTION"
+        fi
+
+        if command -v sshd >/dev/null 2>&1; then
+            sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
+        fi
+
+        if command -v ss >/dev/null 2>&1; then
+            ss -H -ltnp 2>/dev/null | awk '
+                /"sshd"/ {
+                    address = $4
+                    sub(/^.*:/, "", address)
+                    print address
+                }
+            ' || true
+        fi
+    } | normalize_ssh_ports
+}
+
+restore_fail2ban_jail() {
+    local jail_file="$1"
+    local backup_file="$2"
+
+    if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+        cp -a -- "$backup_file" "$jail_file"
+    else
+        rm -f -- "$jail_file"
+    fi
+}
+
+configure_fail2ban_ssh() {
+    local ssh_ports
+    local jail_file="/etc/fail2ban/jail.d/3ax-ui-ssh.local"
+    local temp_file
+    local backup_file=""
+    local config_output
+
+    ssh_ports="$(detect_ssh_ports)"
+    [[ -n "$ssh_ports" ]] || die "Cannot determine the SSH port for Fail2Ban."
+
+    temp_file="$(mktemp /tmp/3ax-ui-fail2ban.XXXXXX)"
+    chmod 600 "$temp_file"
+    {
+        printf '%s\n' \
+            '[sshd]' \
+            'enabled = true' \
+            'backend = systemd' \
+            'mode = normal' \
+            "port = $ssh_ports" \
+            'maxretry = 5' \
+            'findtime = 10m' \
+            'bantime = 1h' \
+            'bantime.increment = true' \
+            'bantime.maxtime = 1d' \
+            'usedns = no' \
+            'banaction = nftables[type=multiport]'
+    } > "$temp_file"
+
+    mkdir -p /etc/fail2ban/jail.d
+    if [[ -f "$jail_file" ]]; then
+        backup_file="$(mktemp /tmp/3ax-ui-fail2ban-backup.XXXXXX)"
+        cp -a -- "$jail_file" "$backup_file"
+    fi
+    install -m 0644 "$temp_file" "$jail_file"
+    rm -f -- "$temp_file"
+
+    if ! config_output="$(fail2ban-client -t 2>&1)"; then
+        restore_fail2ban_jail "$jail_file" "$backup_file"
+        rm -f -- "$backup_file"
+        printf '%s\n' "$config_output" >&2
+        die "Fail2Ban rejected the generated SSH jail; the previous configuration was restored."
+    fi
+
+    if ! systemctl enable fail2ban.service >/dev/null 2>&1 || \
+        ! systemctl restart fail2ban.service >/dev/null 2>&1; then
+        restore_fail2ban_jail "$jail_file" "$backup_file"
+        rm -f -- "$backup_file"
+        systemctl restart fail2ban.service >/dev/null 2>&1 || true
+        systemctl status --no-pager fail2ban.service >&2 || true
+        die "Fail2Ban could not start; the previous configuration was restored."
+    fi
+
+    for _ in {1..20}; do
+        if fail2ban-client ping >/dev/null 2>&1 && \
+            fail2ban-client status sshd >/dev/null 2>&1; then
+            rm -f -- "$backup_file"
+            info "Fail2Ban protects SSH on port(s): $ssh_ports"
+            return
+        fi
+        sleep 1
+    done
+
+    restore_fail2ban_jail "$jail_file" "$backup_file"
+    rm -f -- "$backup_file"
+    systemctl restart fail2ban.service >/dev/null 2>&1 || true
+    journalctl -u fail2ban.service -n 30 --no-pager >&2 || true
+    die "The Fail2Ban sshd jail did not become active; the previous configuration was restored."
 }
 
 print_disk_diagnostics() {
@@ -152,30 +543,134 @@ print_disk_diagnostics() {
     fi
 }
 
+audit_package_names() {
+    awk '/^ [[:alnum:]][^[:space:]]*[[:space:]]/ {print $1}'
+}
+
+audit_packages_are_amneziawg() {
+    local package
+
+    [[ $# -gt 0 ]] || return 1
+    for package in "$@"; do
+        case "$package" in
+            amneziawg|amneziawg-dkms|amneziawg-tools) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+detect_grub_install_disk() {
+    local boot_device
+    local boot_real
+    local boot_name
+    local boot_sys_path
+    local parent_sys_path
+    local disk_name
+    local disk_path
+    local drive_hint
+    local hinted_disk
+    local read_only
+    local removable
+    local sectors
+
+    command -v grub-probe >/dev/null 2>&1 || return 1
+    boot_device="$(grub-probe --target=device /boot 2>/dev/null || true)"
+    [[ "$boot_device" == /dev/* && -b "$boot_device" ]] || return 1
+
+    boot_real="$(readlink -f "$boot_device" 2>/dev/null || true)"
+    [[ "$boot_real" == /dev/* && -b "$boot_real" ]] || return 1
+    boot_name="${boot_real##*/}"
+    boot_sys_path="/sys/class/block/$boot_name"
+    [[ -e "$boot_sys_path" ]] || return 1
+
+    if [[ -f "$boot_sys_path/partition" ]]; then
+        parent_sys_path="$(dirname "$(readlink -f "$boot_sys_path")")"
+        disk_name="${parent_sys_path##*/}"
+    else
+        disk_name="$boot_name"
+    fi
+
+    case "$disk_name" in
+        dm-*|loop*|md*|nbd*|ram*|sr*|zram*) return 1 ;;
+    esac
+
+    disk_path="/dev/$disk_name"
+    [[ -b "$disk_path" ]] || return 1
+    [[ -e "/sys/class/block/$disk_name" ]] || return 1
+    [[ ! -f "/sys/class/block/$disk_name/partition" ]] || return 1
+
+    read_only="$(cat "/sys/class/block/$disk_name/ro" 2>/dev/null || true)"
+    removable="$(cat "/sys/class/block/$disk_name/removable" 2>/dev/null || true)"
+    sectors="$(cat "/sys/class/block/$disk_name/size" 2>/dev/null || true)"
+    [[ "$read_only" == "0" && "$removable" == "0" ]] || return 1
+    [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -gt 2097152 ]] || return 1
+
+    drive_hint="$(grub-probe --target=drive /boot 2>/dev/null || true)"
+    hinted_disk="$(sed -n 's#.*\(/dev/[^,)]*\).*#\1#p' <<< "$drive_hint")"
+    if [[ -n "$hinted_disk" ]]; then
+        [[ "$(readlink -f "$hinted_disk" 2>/dev/null || true)" == "$disk_path" ]] || return 1
+    fi
+
+    printf '%s\n' "$disk_path"
+}
+
+repair_unfinished_grub() {
+    local disk
+    local backup
+    local remaining_audit
+
+    print_disk_diagnostics
+    disk="$(detect_grub_install_disk)" || \
+        die "Cannot determine one safe whole boot disk for automatic grub-pc repair."
+
+    backup="/root/grub-pc-debconf-before-3ax-$(date -u +%Y%m%dT%H%M%SZ).dat"
+    if [[ -f /var/cache/debconf/config.dat ]]; then
+        cp -a /var/cache/debconf/config.dat "$backup"
+        chmod 600 "$backup"
+    fi
+
+    info "Repairing unfinished grub-pc configuration on verified disk $disk"
+    printf '%s\n' \
+        "grub-pc grub-pc/install_devices multiselect $disk" \
+        "grub-pc grub-pc/install_devices_disks_changed multiselect $disk" \
+        'grub-pc grub-pc/install_devices_empty boolean false' \
+        | debconf-set-selections
+
+    DEBIAN_FRONTEND=noninteractive dpkg --configure grub-pc
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+
+    remaining_audit="$(LC_ALL=C dpkg --audit 2>&1 || true)"
+    if [[ -n "$remaining_audit" ]]; then
+        printf '%s\n' "$remaining_audit" >&2
+        die "dpkg still contains unfinished packages after grub-pc repair."
+    fi
+
+    info "grub-pc and dpkg were repaired successfully"
+    if [[ -f "$backup" ]]; then
+        printf 'Previous debconf state: %s\n' "$backup"
+    fi
+}
+
 check_package_manager_health() {
     local audit_output
     local apt_check_output
+    local -a audit_packages=()
 
     audit_output="$(LC_ALL=C dpkg --audit 2>&1 || true)"
     if [[ -n "$audit_output" ]]; then
-        printf '%s\n' "$audit_output" >&2
-        print_disk_diagnostics
-
-        if grep -qw 'grub-pc' <<< "$audit_output"; then
-            printf '\nThe unfinished grub-pc setup must be repaired before installing 3AX-UI.\n' >&2
-            printf 'Do not guess the boot disk. Use the diagnostics above, then run:\n\n' >&2
-            printf '  DEBIAN_FRONTEND=dialog dpkg --configure grub-pc\n' >&2
-            printf '  dpkg --configure -a\n' >&2
-            printf '  dpkg --audit\n\n' >&2
-            printf 'In the GRUB dialog select the current whole boot disk, not a partition.\n' >&2
+        mapfile -t audit_packages < <(audit_package_names <<< "$audit_output")
+        if [[ ${#audit_packages[@]} -eq 1 && "${audit_packages[0]}" == "grub-pc" ]]; then
+            repair_unfinished_grub
+        elif audit_packages_are_amneziawg "${audit_packages[@]}"; then
+            AWG_REPAIR_PENDING=1
+            warn "An unfinished AmneziaWG package installation will be repaired automatically."
         else
-            printf '\nRepair unfinished packages with dpkg --configure -a, then rerun this installer.\n' >&2
+            printf '%s\n' "$audit_output" >&2
+            die "dpkg contains unfinished packages that cannot be repaired safely by this installer."
         fi
-
-        die "The Debian package database contains unfinished packages."
     fi
 
-    if ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then
+    if [[ "$AWG_REPAIR_PENDING" -eq 0 ]] && ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then
         printf '%s\n' "$apt_check_output" >&2
         die "APT dependency checks failed. Repair APT/dpkg before installing 3AX-UI."
     fi
@@ -328,6 +823,303 @@ open_firewall_port() {
     fi
 }
 
+sqlite3_clean() {
+    sqlite3 -init /dev/null -batch -noheader "$@"
+}
+
+valid_udp_port() {
+    [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]
+}
+
+udp_port_in_use() {
+    local port="$1"
+
+    ss -H -lun 2>/dev/null | grep -Eq "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)"
+}
+
+choose_mobile_awg_port() {
+    local current_port="${1:-}"
+    local requested="${AWG_PORT:-}"
+    local candidate
+    local random_hex
+    local attempt
+
+    if [[ -n "$requested" ]]; then
+        valid_udp_port "$requested" || die "AWG_PORT must be between 1 and 65535."
+        if [[ "$requested" != "$current_port" ]] && udp_port_in_use "$requested"; then
+            die "UDP port $requested is already in use."
+        fi
+        printf '%s\n' "$requested"
+        return
+    fi
+
+    if [[ "$DEFAULT_AWG_PORT" == "$current_port" ]] || ! udp_port_in_use "$DEFAULT_AWG_PORT"; then
+        printf '%s\n' "$DEFAULT_AWG_PORT"
+        return
+    fi
+
+    # Keep the automatic fallback out of the high ephemeral range. Some mobile
+    # networks silently discard UDP destinations near the top of 1..65535.
+    for ((attempt = 0; attempt < 128; attempt++)); do
+        random_hex="$(openssl rand -hex 2)"
+        candidate=$((20000 + (16#$random_hex % 20000)))
+        if [[ "$candidate" == "$current_port" ]] || ! udp_port_in_use "$candidate"; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    return 1
+}
+
+write_awg_ipv4_client_compatibility_sql() {
+    cat <<SQL
+CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_INSERT_TRIGGER
+AFTER INSERT ON awg_clients
+WHEN COALESCE(trim(NEW.ipv6_address), '') = ''
+ AND EXISTS (
+     SELECT 1 FROM awg_servers
+     WHERE id = NEW.server_id AND COALESCE(ipv6_enabled, 0) = 0
+ )
+ AND lower(replace(COALESCE(NEW.client_allowed_ips, ''), ' ', ''))
+     IN ('0.0.0.0/0,::/0', '::/0,0.0.0.0/0')
+BEGIN
+    UPDATE awg_clients SET client_allowed_ips = '0.0.0.0/0' WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_UPDATE_TRIGGER
+AFTER UPDATE OF client_allowed_ips, ipv6_address, server_id ON awg_clients
+WHEN COALESCE(trim(NEW.ipv6_address), '') = ''
+ AND EXISTS (
+     SELECT 1 FROM awg_servers
+     WHERE id = NEW.server_id AND COALESCE(ipv6_enabled, 0) = 0
+ )
+ AND lower(replace(COALESCE(NEW.client_allowed_ips, ''), ' ', ''))
+     IN ('0.0.0.0/0,::/0', '::/0,0.0.0.0/0')
+BEGIN
+    UPDATE awg_clients SET client_allowed_ips = '0.0.0.0/0' WHERE id = NEW.id;
+END;
+SQL
+}
+
+backup_awg_database() {
+    local backup_dir="/root/3ax-ui-backups"
+    local backup_file
+
+    backup_file="$backup_dir/x-ui-before-awg-mobile-$(date -u +%Y%m%dT%H%M%SZ).db"
+
+    mkdir -p "$backup_dir"
+    chmod 700 "$backup_dir"
+    sqlite3_clean "$XUI_DB" ".backup '$backup_file'"
+    chmod 600 "$backup_file"
+    printf '%s\n' "$backup_file"
+}
+
+restore_awg_database() {
+    local backup_file="$1"
+
+    systemctl stop x-ui.service >/dev/null 2>&1 || true
+    install -m 0600 "$backup_file" "$XUI_DB"
+    systemctl start x-ui.service >/dev/null 2>&1 || true
+}
+
+configure_ipv4_forwarding() {
+    local sysctl_file="/etc/sysctl.d/90-3ax-ui-awg-forwarding.conf"
+
+    printf '%s\n' 'net.ipv4.ip_forward = 1' > "$sysctl_file"
+    chmod 644 "$sysctl_file"
+    sysctl -q -w net.ipv4.ip_forward=1
+}
+
+configure_awg_mobile_compatibility() {
+    local server_row
+    local server_id
+    local enabled
+    local interface_name
+    local current_port
+    local client_count
+    local desired_port
+    local route_repairs
+    local trigger_count
+    local backup_file=""
+    local config_file
+    local sql
+    local changed=0
+
+    [[ -s "$XUI_DB" ]] || return
+    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_servers';" 2>/dev/null)" == "1" ]] || return
+    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_clients';" 2>/dev/null)" == "1" ]] || return
+
+    server_row="$(sqlite3_clean -separator '|' "$XUI_DB" \
+        "SELECT id, CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port, (SELECT count(*) FROM awg_clients WHERE server_id = awg_servers.id) FROM awg_servers ORDER BY id LIMIT 1;" \
+        2>/dev/null || true)"
+    [[ -n "$server_row" ]] || return
+    IFS='|' read -r server_id enabled interface_name current_port client_count <<< "$server_row"
+
+    [[ "$server_id" =~ ^[0-9]+$ && "$server_id" -ge 1 ]] || die "The AmneziaWG server has an invalid database ID."
+    [[ "$enabled" == "0" || "$enabled" == "1" ]] || die "The AmneziaWG server has an invalid enabled state."
+    [[ "$client_count" =~ ^[0-9]+$ ]] || die "The AmneziaWG client count is invalid."
+    valid_awg_interface_name "$interface_name" || die "The AmneziaWG server has an unsafe interface name."
+    valid_udp_port "$current_port" || die "The AmneziaWG server has an invalid UDP listen port."
+
+    desired_port="$current_port"
+    if [[ -n "${AWG_PORT:-}" ]]; then
+        desired_port="$(choose_mobile_awg_port "$current_port")"
+    elif [[ "$enabled" == "0" && "$client_count" == "0" ]]; then
+        desired_port="$(choose_mobile_awg_port "$current_port")" || \
+            die "Cannot find a mobile-compatible UDP port for AmneziaWG."
+    fi
+
+    if [[ "$desired_port" != "$current_port" && ( "$enabled" == "1" || "$client_count" != "0" ) && "${AWG_RECONFIGURE_EXISTING:-0}" != "1" ]]; then
+        die "Changing an existing AmneziaWG port requires AWG_RECONFIGURE_EXISTING=1; clients must re-import their configs."
+    fi
+
+    route_repairs="$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM awg_clients c JOIN awg_servers s ON s.id=c.server_id WHERE COALESCE(s.ipv6_enabled,0)=0 AND COALESCE(trim(c.ipv6_address),'')='' AND lower(replace(COALESCE(c.client_allowed_ips,''),' ','')) IN ('0.0.0.0/0,::/0','::/0,0.0.0.0/0');")"
+    trigger_count="$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('$AWG_IPV4_INSERT_TRIGGER','$AWG_IPV4_UPDATE_TRIGGER');")"
+
+    if [[ "$desired_port" != "$current_port" || "$route_repairs" != "0" || "$trigger_count" != "2" ]]; then
+        backup_file="$(backup_awg_database)" || die "Cannot back up the 3AX-UI database before AWG compatibility changes."
+    fi
+
+    if [[ "$desired_port" != "$current_port" && "$enabled" == "1" ]]; then
+        systemctl stop x-ui.service || die "Cannot stop x-ui.service for the requested AWG port change."
+        config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+        if awg show "$interface_name" >/dev/null 2>&1; then
+            if ! awg-quick down "$config_file" >/dev/null 2>&1; then
+                systemctl start x-ui.service >/dev/null 2>&1 || true
+                die "Cannot stop the existing AmneziaWG interface safely; its port was not changed."
+            fi
+        fi
+    fi
+
+    sql="$(write_awg_ipv4_client_compatibility_sql)"
+    sql+=$'\n'
+    sql+="UPDATE awg_clients SET client_allowed_ips='0.0.0.0/0' WHERE id IN (SELECT c.id FROM awg_clients c JOIN awg_servers s ON s.id=c.server_id WHERE COALESCE(s.ipv6_enabled,0)=0 AND COALESCE(trim(c.ipv6_address),'')='' AND lower(replace(COALESCE(c.client_allowed_ips,''),' ','')) IN ('0.0.0.0/0,::/0','::/0,0.0.0.0/0'));"
+    if [[ "$desired_port" != "$current_port" ]]; then
+        sql+=$'\n'
+        sql+="UPDATE awg_servers SET listen_port=$desired_port WHERE id=$server_id; UPDATE inbounds SET port=$desired_port WHERE protocol='amneziawg';"
+    fi
+
+    if ! sqlite3_clean "$XUI_DB" "BEGIN IMMEDIATE; $sql COMMIT;"; then
+        if [[ -n "$backup_file" ]]; then
+            restore_awg_database "$backup_file"
+        fi
+        die "Cannot apply AmneziaWG mobile compatibility settings; the database was restored."
+    fi
+
+    configure_ipv4_forwarding
+    open_firewall_port "$desired_port" udp
+
+    if [[ "$desired_port" != "$current_port" ]]; then
+        changed=1
+        if [[ "$enabled" == "1" ]]; then
+            systemctl start x-ui.service || {
+                restore_awg_database "$backup_file"
+                die "x-ui.service failed after the AWG port change; the database was restored."
+            }
+            for _ in {1..20}; do
+                if awg show "$interface_name" >/dev/null 2>&1 && verify_awg_listen_port "$interface_name" "$desired_port"; then
+                    break
+                fi
+                sleep 1
+            done
+            if ! awg show "$interface_name" >/dev/null 2>&1 || ! verify_awg_listen_port "$interface_name" "$desired_port"; then
+                restore_awg_database "$backup_file"
+                die "AmneziaWG did not restart on UDP $desired_port; the database was restored."
+            fi
+        fi
+        info "AmneziaWG uses mobile-compatible UDP port $desired_port"
+    fi
+
+    if [[ "$route_repairs" != "0" ]]; then
+        changed=1
+        warn "$route_repairs IPv4-only AWG client profile(s) were corrected; export and import them again on the devices."
+    fi
+    if [[ "$changed" == "0" ]]; then
+        info "AmneziaWG mobile client defaults are compatible"
+    fi
+    if [[ -n "$backup_file" ]]; then
+        printf 'AWG compatibility backup: %s\n' "$backup_file"
+    fi
+}
+
+valid_awg_interface_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]
+}
+
+verify_awg_listen_port() {
+    local interface_name="$1"
+    local expected_port="$2"
+    local actual_port
+
+    actual_port="$(awg show "$interface_name" listen-port 2>/dev/null || true)"
+    [[ "$actual_port" == "$expected_port" ]]
+}
+
+ensure_enabled_awg_runtime() {
+    local server_row
+    local enabled
+    local interface_name
+    local listen_port
+    local config_file
+    local start_output=""
+
+    [[ -x "$XUI_BIN" && -s "$XUI_DB" ]] || return
+
+    systemctl enable x-ui.service >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet x-ui.service; then
+        systemctl restart x-ui.service || die "x-ui.service could not be started."
+    fi
+
+    server_row="$(sqlite3_clean -separator '|' "$XUI_DB" \
+        "SELECT CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port FROM awg_servers ORDER BY id LIMIT 1;" \
+        2>/dev/null || true)"
+    [[ -n "$server_row" ]] || return
+    IFS='|' read -r enabled interface_name listen_port <<< "$server_row"
+    [[ "$enabled" == "1" ]] || return
+    valid_awg_interface_name "$interface_name" || \
+        die "The enabled AmneziaWG server has an unsafe interface name in the panel database."
+    [[ "$listen_port" =~ ^[0-9]+$ && "$listen_port" -ge 1 && "$listen_port" -le 65535 ]] || \
+        die "The enabled AmneziaWG server has an invalid UDP listen port."
+
+    if awg show "$interface_name" >/dev/null 2>&1; then
+        verify_awg_listen_port "$interface_name" "$listen_port" || \
+            die "AmneziaWG is running on a different UDP port than the panel configuration."
+        open_firewall_port "$listen_port" udp
+        info "Enabled AmneziaWG server is running on $interface_name (UDP $listen_port)"
+        return
+    fi
+
+    info "Restoring the enabled AmneziaWG server from the existing panel configuration"
+    systemctl restart x-ui.service || die "x-ui.service could not be restarted to restore AmneziaWG."
+    for _ in {1..20}; do
+        if awg show "$interface_name" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! awg show "$interface_name" >/dev/null 2>&1; then
+        config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+        [[ -s "$config_file" ]] || {
+            journalctl -u x-ui.service -n 30 --no-pager >&2 || true
+            die "3AX-UI did not generate the enabled AmneziaWG server configuration."
+        }
+        if ! start_output="$(awg-quick up "$config_file" 2>&1)"; then
+            printf '%s\n' "$start_output" >&2
+            journalctl -u x-ui.service -n 30 --no-pager >&2 || true
+            die "The saved AmneziaWG server configuration could not be started. Client keys and settings were not changed."
+        fi
+    fi
+
+    awg show "$interface_name" >/dev/null 2>&1 || \
+        die "AmneziaWG reported a successful start but the interface is not available."
+    verify_awg_listen_port "$interface_name" "$listen_port" || \
+        die "AmneziaWG started on a different UDP port than the panel configuration."
+    open_firewall_port "$listen_port" udp
+    info "AmneziaWG was restored without changing clients or keys ($interface_name, UDP $listen_port)"
+}
+
 ensure_http_challenge_available() {
     if ss -H -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:80([[:space:]]|$)'; then
         die "TCP port 80 is already in use. This installer is intended for a clean VPS and needs port 80 for HTTPS."
@@ -364,10 +1156,8 @@ install_upstream_panel() {
 
 verify_amneziawg() {
     info "Checking AmneziaWG support"
-    command -v awg >/dev/null 2>&1 || \
-        die "The awg utility is missing. See the upstream installation log and rerun this installer."
-    modprobe amneziawg >/dev/null 2>&1 || \
-        die "The AmneziaWG kernel module cannot be loaded. Check DKMS and Secure Boot, then rerun."
+    amneziawg_is_ready || \
+        die "The AmneziaWG tools or kernel module failed the final runtime test."
 }
 
 obtain_certificate() {
@@ -477,16 +1267,30 @@ print_credentials() {
 
 main() {
     require_root
+    load_os
+    check_package_manager_health
+
+    if [[ "$AWG_REPAIR_PENDING" -eq 1 ]]; then
+        install_amneziawg_stack
+        AWG_REPAIR_PENDING=0
+        check_package_manager_health
+        [[ "$AWG_REPAIR_PENDING" -eq 0 ]] || \
+            die "dpkg still contains unfinished AmneziaWG packages after repair."
+    fi
+
+    sanitize_legacy_amnezia_sources
+    install_prerequisites
+    validate_host
+    configure_fail2ban_ssh
+    install_amneziawg_stack
 
     if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
+        configure_awg_mobile_compatibility
+        ensure_enabled_awg_runtime
         print_credentials
         exit 0
     fi
 
-    load_os
-    check_package_manager_health
-    install_prerequisites
-    validate_host
     load_or_create_state
     verify_dns
     install_upstream_panel
@@ -495,6 +1299,8 @@ main() {
     configure_renewal
     configure_panel
     verify_panel
+    configure_awg_mobile_compatibility
+    ensure_enabled_awg_runtime
     save_credentials
     print_credentials
 }
