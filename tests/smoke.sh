@@ -53,6 +53,17 @@ mapfile -t parsed_audit_packages < <(audit_package_names <<< "$audit_fixture")
 audit_packages_are_amneziawg amneziawg-dkms amneziawg-tools
 assert_fails audit_packages_are_amneziawg amneziawg-dkms grub-pc
 
+valid_awg_interface_name awg0
+valid_awg_interface_name awg-test.1
+assert_fails valid_awg_interface_name 'awg interface'
+assert_fails valid_awg_interface_name 'this-interface-name-is-too-long'
+
+awg_smoke_config="$(write_awg_smoke_config test-private-key eth0 awg3axtest)"
+grep -Fxq 'H1 = 5-1005' <<< "$awg_smoke_config"
+grep -Fxq 'I1 = <r 32>' <<< "$awg_smoke_config"
+grep -Fq 'iptables -w -t nat -A POSTROUTING -s 192.0.2.0/31 -o eth0 -j MASQUERADE' <<< "$awg_smoke_config"
+grep -Fq 'iptables -w -A FORWARD -i awg3axtest -j ACCEPT' <<< "$awg_smoke_config"
+
 mock_bin="$(mktemp -d)"
 cleanup() {
     rm -rf -- "$mock_bin"

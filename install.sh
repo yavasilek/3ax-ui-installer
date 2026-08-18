@@ -4,8 +4,10 @@ set -Eeuo pipefail
 
 readonly UPSTREAM_INSTALL_URL="https://raw.githubusercontent.com/coinman-dev/3ax-ui/main/install.sh"
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
+readonly XUI_DB="/etc/x-ui/x-ui.db"
 readonly CREDENTIALS_FILE="/root/3ax-ui-credentials.txt"
 readonly STATE_FILE="/root/.3ax-ui-installer-state"
+readonly AWG_CONFIG_DIR="/etc/amnezia/amneziawg"
 readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
 readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
 readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
@@ -93,6 +95,9 @@ install_prerequisites() {
     command -v gpg >/dev/null 2>&1 || missing_packages+=(gnupg)
     command -v fail2ban-client >/dev/null 2>&1 || missing_packages+=(fail2ban)
     command -v nft >/dev/null 2>&1 || missing_packages+=(nftables)
+    command -v iptables >/dev/null 2>&1 || missing_packages+=(iptables)
+    command -v sqlite3 >/dev/null 2>&1 || missing_packages+=(sqlite3)
+    command -v ndppd >/dev/null 2>&1 || missing_packages+=(ndppd)
     if ! dpkg-query -W -f='${Status}' python3-systemd 2>/dev/null | grep -q 'ok installed'; then
         missing_packages+=(python3-systemd)
     fi
@@ -247,12 +252,95 @@ amneziawg_is_ready() {
     ip link del "$test_interface" >/dev/null 2>&1 || true
 }
 
+write_awg_smoke_config() {
+    local private_key="$1"
+    local external_interface="$2"
+    local test_interface="$3"
+
+    cat <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = 192.0.2.1/32
+MTU = 1420
+Jc = 4
+Jmin = 40
+Jmax = 90
+S1 = 56
+S2 = 88
+S3 = 12
+S4 = 8
+H1 = 5-1005
+H2 = 2005-3005
+H3 = 4005-5005
+H4 = 6005-7005
+I1 = <r 32>
+PostUp = iptables -w -t nat -A POSTROUTING -s 192.0.2.0/31 -o $external_interface -j MASQUERADE; iptables -w -A FORWARD -i $test_interface -j ACCEPT; iptables -w -A FORWARD -o $test_interface -j ACCEPT; sysctl -q -w net.ipv4.ip_forward=1
+PostDown = iptables -w -t nat -D POSTROUTING -s 192.0.2.0/31 -o $external_interface -j MASQUERADE; iptables -w -D FORWARD -i $test_interface -j ACCEPT; iptables -w -D FORWARD -o $test_interface -j ACCEPT
+EOF
+}
+
+cleanup_awg_smoke() {
+    local config_file="$1"
+    local test_interface="$2"
+    local external_interface="$3"
+    local test_dir
+
+    if [[ -s "$config_file" ]] && command -v awg-quick >/dev/null 2>&1; then
+        awg-quick down "$config_file" >/dev/null 2>&1 || true
+    fi
+    ip link del "$test_interface" >/dev/null 2>&1 || true
+    iptables -w -t nat -D POSTROUTING -s 192.0.2.0/31 -o "$external_interface" -j MASQUERADE >/dev/null 2>&1 || true
+    iptables -w -D FORWARD -i "$test_interface" -j ACCEPT >/dev/null 2>&1 || true
+    iptables -w -D FORWARD -o "$test_interface" -j ACCEPT >/dev/null 2>&1 || true
+    rm -f -- "$config_file"
+    test_dir="$(dirname "$config_file")"
+    rmdir -- "$test_dir" >/dev/null 2>&1 || true
+}
+
+amneziawg_server_smoke_test() {
+    local private_key
+    local external_interface
+    local test_interface="awg3ax$$"
+    local test_dir
+    local config_file
+    local output
+
+    command -v iptables >/dev/null 2>&1 || return 1
+    external_interface="$(ip -4 route show default 2>/dev/null | awk '$1 == "default" {print $5; exit}')"
+    [[ "$external_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+
+    private_key="$(awg genkey 2>/dev/null)"
+    [[ -n "$private_key" ]] || return 1
+    test_dir="$(mktemp -d /tmp/3ax-ui-awg-smoke.XXXXXX)"
+    config_file="$test_dir/$test_interface.conf"
+    write_awg_smoke_config "$private_key" "$external_interface" "$test_interface" > "$config_file"
+    chmod 600 "$config_file"
+
+    if ! output="$(awg-quick up "$config_file" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+        return 1
+    fi
+    if ! awg show "$test_interface" >/dev/null 2>&1; then
+        cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+        return 1
+    fi
+    if ! output="$(awg-quick down "$config_file" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+        return 1
+    fi
+
+    cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
+}
+
 install_amneziawg_stack() {
     local kernel_version
     local headers_package
 
-    if amneziawg_is_ready; then
-        info "AmneziaWG tools and kernel module are already working"
+    if [[ "$AWG_REPAIR_PENDING" -eq 0 ]] && \
+        amneziawg_is_ready && amneziawg_server_smoke_test; then
+        info "AmneziaWG passed the full AWG 2.0 server startup test"
         return
     fi
 
@@ -271,6 +359,9 @@ install_amneziawg_stack() {
         build-essential \
         dkms \
         "$headers_package" \
+        iptables \
+        ndppd \
+        sqlite3 \
         amneziawg \
         amneziawg-dkms \
         amneziawg-tools
@@ -279,13 +370,13 @@ install_amneziawg_stack() {
     depmod -a "$kernel_version"
     printf 'amneziawg\n' > /etc/modules-load.d/amneziawg.conf
 
-    if ! amneziawg_is_ready; then
+    if ! amneziawg_is_ready || ! amneziawg_server_smoke_test; then
         dkms status >&2 || true
         modinfo amneziawg >&2 || true
-        die "AmneziaWG was installed but its tools or kernel module did not pass the runtime test."
+        die "AmneziaWG was installed but a complete AWG 2.0 server could not be started."
     fi
 
-    info "AmneziaWG tools and kernel module passed the runtime test"
+    info "AmneziaWG passed the full AWG 2.0 server startup test"
 }
 
 normalize_ssh_ports() {
@@ -729,6 +820,83 @@ open_firewall_port() {
     fi
 }
 
+valid_awg_interface_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]
+}
+
+verify_awg_listen_port() {
+    local interface_name="$1"
+    local expected_port="$2"
+    local actual_port
+
+    actual_port="$(awg show "$interface_name" listen-port 2>/dev/null || true)"
+    [[ "$actual_port" == "$expected_port" ]]
+}
+
+ensure_enabled_awg_runtime() {
+    local server_row
+    local enabled
+    local interface_name
+    local listen_port
+    local config_file
+    local start_output=""
+
+    [[ -x "$XUI_BIN" && -s "$XUI_DB" ]] || return
+
+    systemctl enable x-ui.service >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet x-ui.service; then
+        systemctl restart x-ui.service || die "x-ui.service could not be started."
+    fi
+
+    server_row="$(sqlite3 -separator '|' "$XUI_DB" \
+        "SELECT CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port FROM awg_servers ORDER BY id LIMIT 1;" \
+        2>/dev/null || true)"
+    [[ -n "$server_row" ]] || return
+    IFS='|' read -r enabled interface_name listen_port <<< "$server_row"
+    [[ "$enabled" == "1" ]] || return
+    valid_awg_interface_name "$interface_name" || \
+        die "The enabled AmneziaWG server has an unsafe interface name in the panel database."
+    [[ "$listen_port" =~ ^[0-9]+$ && "$listen_port" -ge 1 && "$listen_port" -le 65535 ]] || \
+        die "The enabled AmneziaWG server has an invalid UDP listen port."
+
+    if awg show "$interface_name" >/dev/null 2>&1; then
+        verify_awg_listen_port "$interface_name" "$listen_port" || \
+            die "AmneziaWG is running on a different UDP port than the panel configuration."
+        open_firewall_port "$listen_port" udp
+        info "Enabled AmneziaWG server is running on $interface_name (UDP $listen_port)"
+        return
+    fi
+
+    info "Restoring the enabled AmneziaWG server from the existing panel configuration"
+    systemctl restart x-ui.service || die "x-ui.service could not be restarted to restore AmneziaWG."
+    for _ in {1..20}; do
+        if awg show "$interface_name" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! awg show "$interface_name" >/dev/null 2>&1; then
+        config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+        [[ -s "$config_file" ]] || {
+            journalctl -u x-ui.service -n 30 --no-pager >&2 || true
+            die "3AX-UI did not generate the enabled AmneziaWG server configuration."
+        }
+        if ! start_output="$(awg-quick up "$config_file" 2>&1)"; then
+            printf '%s\n' "$start_output" >&2
+            journalctl -u x-ui.service -n 30 --no-pager >&2 || true
+            die "The saved AmneziaWG server configuration could not be started. Client keys and settings were not changed."
+        fi
+    fi
+
+    awg show "$interface_name" >/dev/null 2>&1 || \
+        die "AmneziaWG reported a successful start but the interface is not available."
+    verify_awg_listen_port "$interface_name" "$listen_port" || \
+        die "AmneziaWG started on a different UDP port than the panel configuration."
+    open_firewall_port "$listen_port" udp
+    info "AmneziaWG was restored without changing clients or keys ($interface_name, UDP $listen_port)"
+}
+
 ensure_http_challenge_available() {
     if ss -H -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:80([[:space:]]|$)'; then
         die "TCP port 80 is already in use. This installer is intended for a clean VPS and needs port 80 for HTTPS."
@@ -894,6 +1062,7 @@ main() {
     install_amneziawg_stack
 
     if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
+        ensure_enabled_awg_runtime
         print_credentials
         exit 0
     fi
@@ -906,6 +1075,7 @@ main() {
     configure_renewal
     configure_panel
     verify_panel
+    ensure_enabled_awg_runtime
     save_credentials
     print_credentials
 }
