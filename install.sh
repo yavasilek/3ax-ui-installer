@@ -152,27 +152,116 @@ print_disk_diagnostics() {
     fi
 }
 
+audit_package_names() {
+    awk '/^ [[:alnum:]][^[:space:]]*[[:space:]]/ {print $1}'
+}
+
+detect_grub_install_disk() {
+    local boot_device
+    local boot_real
+    local boot_name
+    local boot_sys_path
+    local parent_sys_path
+    local disk_name
+    local disk_path
+    local drive_hint
+    local hinted_disk
+    local read_only
+    local removable
+    local sectors
+
+    command -v grub-probe >/dev/null 2>&1 || return 1
+    boot_device="$(grub-probe --target=device /boot 2>/dev/null || true)"
+    [[ "$boot_device" == /dev/* && -b "$boot_device" ]] || return 1
+
+    boot_real="$(readlink -f "$boot_device" 2>/dev/null || true)"
+    [[ "$boot_real" == /dev/* && -b "$boot_real" ]] || return 1
+    boot_name="${boot_real##*/}"
+    boot_sys_path="/sys/class/block/$boot_name"
+    [[ -e "$boot_sys_path" ]] || return 1
+
+    if [[ -f "$boot_sys_path/partition" ]]; then
+        parent_sys_path="$(dirname "$(readlink -f "$boot_sys_path")")"
+        disk_name="${parent_sys_path##*/}"
+    else
+        disk_name="$boot_name"
+    fi
+
+    case "$disk_name" in
+        dm-*|loop*|md*|nbd*|ram*|sr*|zram*) return 1 ;;
+    esac
+
+    disk_path="/dev/$disk_name"
+    [[ -b "$disk_path" ]] || return 1
+    [[ -e "/sys/class/block/$disk_name" ]] || return 1
+    [[ ! -f "/sys/class/block/$disk_name/partition" ]] || return 1
+
+    read_only="$(cat "/sys/class/block/$disk_name/ro" 2>/dev/null || true)"
+    removable="$(cat "/sys/class/block/$disk_name/removable" 2>/dev/null || true)"
+    sectors="$(cat "/sys/class/block/$disk_name/size" 2>/dev/null || true)"
+    [[ "$read_only" == "0" && "$removable" == "0" ]] || return 1
+    [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -gt 2097152 ]] || return 1
+
+    drive_hint="$(grub-probe --target=drive /boot 2>/dev/null || true)"
+    hinted_disk="$(sed -n 's#.*\(/dev/[^,)]*\).*#\1#p' <<< "$drive_hint")"
+    if [[ -n "$hinted_disk" ]]; then
+        [[ "$(readlink -f "$hinted_disk" 2>/dev/null || true)" == "$disk_path" ]] || return 1
+    fi
+
+    printf '%s\n' "$disk_path"
+}
+
+repair_unfinished_grub() {
+    local disk
+    local backup
+    local remaining_audit
+
+    print_disk_diagnostics
+    disk="$(detect_grub_install_disk)" || \
+        die "Cannot determine one safe whole boot disk for automatic grub-pc repair."
+
+    backup="/root/grub-pc-debconf-before-3ax-$(date -u +%Y%m%dT%H%M%SZ).dat"
+    if [[ -f /var/cache/debconf/config.dat ]]; then
+        cp -a /var/cache/debconf/config.dat "$backup"
+        chmod 600 "$backup"
+    fi
+
+    info "Repairing unfinished grub-pc configuration on verified disk $disk"
+    printf '%s\n' \
+        "grub-pc grub-pc/install_devices multiselect $disk" \
+        "grub-pc grub-pc/install_devices_disks_changed multiselect $disk" \
+        'grub-pc grub-pc/install_devices_empty boolean false' \
+        | debconf-set-selections
+
+    DEBIAN_FRONTEND=noninteractive dpkg --configure grub-pc
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+
+    remaining_audit="$(LC_ALL=C dpkg --audit 2>&1 || true)"
+    if [[ -n "$remaining_audit" ]]; then
+        printf '%s\n' "$remaining_audit" >&2
+        die "dpkg still contains unfinished packages after grub-pc repair."
+    fi
+
+    info "grub-pc and dpkg were repaired successfully"
+    if [[ -f "$backup" ]]; then
+        printf 'Previous debconf state: %s\n' "$backup"
+    fi
+}
+
 check_package_manager_health() {
     local audit_output
     local apt_check_output
+    local -a audit_packages=()
 
     audit_output="$(LC_ALL=C dpkg --audit 2>&1 || true)"
     if [[ -n "$audit_output" ]]; then
-        printf '%s\n' "$audit_output" >&2
-        print_disk_diagnostics
-
-        if grep -qw 'grub-pc' <<< "$audit_output"; then
-            printf '\nThe unfinished grub-pc setup must be repaired before installing 3AX-UI.\n' >&2
-            printf 'Do not guess the boot disk. Use the diagnostics above, then run:\n\n' >&2
-            printf '  DEBIAN_FRONTEND=dialog dpkg --configure grub-pc\n' >&2
-            printf '  dpkg --configure -a\n' >&2
-            printf '  dpkg --audit\n\n' >&2
-            printf 'In the GRUB dialog select the current whole boot disk, not a partition.\n' >&2
+        mapfile -t audit_packages < <(audit_package_names <<< "$audit_output")
+        if [[ ${#audit_packages[@]} -eq 1 && "${audit_packages[0]}" == "grub-pc" ]]; then
+            repair_unfinished_grub
         else
-            printf '\nRepair unfinished packages with dpkg --configure -a, then rerun this installer.\n' >&2
+            printf '%s\n' "$audit_output" >&2
+            die "dpkg contains unfinished packages that cannot be repaired safely by this installer."
         fi
-
-        die "The Debian package database contains unfinished packages."
     fi
 
     if ! apt_check_output="$(LC_ALL=C apt-get check 2>&1)"; then

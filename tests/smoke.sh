@@ -23,13 +23,22 @@ valid_domain "vpn.example.com"
 assert_fails valid_domain "https://vpn.example.com"
 assert_fails valid_domain "bad_domain.example.com"
 
+audit_fixture=$'The following packages are only half configured:\n grub-pc              GRand Unified Bootloader\n'
+mapfile -t parsed_audit_packages < <(audit_package_names <<< "$audit_fixture")
+[[ ${#parsed_audit_packages[@]} -eq 1 ]]
+[[ "${parsed_audit_packages[0]}" == "grub-pc" ]]
+
+audit_fixture=$'The following packages are only half configured:\n grub-pc              GRand Unified Bootloader\n linux-image-test     Linux image\n'
+mapfile -t parsed_audit_packages < <(audit_package_names <<< "$audit_fixture")
+[[ ${#parsed_audit_packages[@]} -eq 2 ]]
+
 mock_bin="$(mktemp -d)"
 cleanup() {
     rm -rf -- "$mock_bin"
 }
 trap cleanup EXIT
 
-printf '%s\n' '#!/usr/bin/env bash' 'printf "unfinished grub-pc package\\n"' > "$mock_bin/dpkg"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "unfinished package state\\n"' > "$mock_bin/dpkg"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$mock_bin/apt-get"
 chmod +x "$mock_bin/dpkg" "$mock_bin/apt-get"
 if (PATH="$mock_bin:$PATH" check_package_manager_health >/dev/null 2>&1); then
