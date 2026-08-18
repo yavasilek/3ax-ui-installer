@@ -110,8 +110,8 @@ install_prerequisites() {
 }
 
 select_amnezia_ppa_suite() {
-    local os_id="${1:-${ID:-}}"
-    local version="${2:-${VERSION_ID:-}}"
+    local os_id="$1"
+    local version="$2"
     local major="${version%%.*}"
 
     [[ "$major" =~ ^[0-9]+$ ]] || return 1
@@ -194,7 +194,8 @@ configure_amnezia_repository() {
     local source_file
     local fingerprint
 
-    suite="$(select_amnezia_ppa_suite)" || die "Cannot select an AmneziaWG package repository."
+    suite="$(select_amnezia_ppa_suite "${ID:-}" "${VERSION_ID:-}")" || \
+        die "Cannot select an AmneziaWG package repository."
     architecture="$(dpkg --print-architecture)"
     [[ "$architecture" == "amd64" || "$architecture" == "arm64" ]] || \
         die "The AmneziaWG repository does not support architecture $architecture."
