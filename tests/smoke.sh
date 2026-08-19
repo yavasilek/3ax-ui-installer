@@ -116,6 +116,19 @@ grep -Fxq 'I1 = <r 32>' <<< "$awg_smoke_config"
 grep -Fq 'iptables -w -t nat -A POSTROUTING -s 192.0.2.0/31 -o eth0 -j MASQUERADE' <<< "$awg_smoke_config"
 grep -Fq 'iptables -w -A FORWARD -i awg3axtest -j ACCEPT' <<< "$awg_smoke_config"
 
+configure_panel_definition="$(declare -f configure_panel)"
+main_definition="$(declare -f main)"
+on_exit_definition="$(declare -f on_exit)"
+save_credentials_definition="$(declare -f save_credentials)"
+grep -Fq 'save_credentials' <<< "$configure_panel_definition"
+grep -Fq 'mark_installation_complete' <<< "$main_definition"
+grep -Fq '! -s "$STATE_FILE"' <<< "$main_definition"
+grep -Fq 'CREDENTIALS_PRINTED' <<< "$on_exit_definition"
+if grep -Fq 'rm -f -- "$STATE_FILE"' <<< "$save_credentials_definition"; then
+    printf 'Credentials must be saved before the resumable state is removed.\n' >&2
+    exit 1
+fi
+
 mock_bin="$(mktemp -d)"
 cleanup() {
     rm -rf -- "$mock_bin"

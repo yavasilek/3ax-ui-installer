@@ -18,6 +18,7 @@ readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
 UPSTREAM_SCRIPT=""
 UPSTREAM_LOG=""
 AWG_REPAIR_PENDING=0
+CREDENTIALS_PRINTED=0
 
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -50,6 +51,14 @@ on_exit() {
         fi
     elif [[ -n "$UPSTREAM_LOG" && -f "$UPSTREAM_LOG" ]]; then
         printf "Installation log: %s\n" "$UPSTREAM_LOG" >&2
+    fi
+
+    if [[ $exit_code -ne 0 && "$CREDENTIALS_PRINTED" -eq 0 && -s "$CREDENTIALS_FILE" ]]; then
+        printf '\n' >&2
+        printf '%b\n' "${yellow}3AX-UI credentials were generated before the installer stopped:${plain}" >&2
+        cat "$CREDENTIALS_FILE" >&2 || true
+        printf 'Credentials are stored in %s (root only).\n' "$CREDENTIALS_FILE" >&2
+        CREDENTIALS_PRINTED=1
     fi
 }
 trap on_exit EXIT
@@ -1211,6 +1220,11 @@ configure_panel() {
         -listenIP "0.0.0.0" \
         -resetTwoFactor true >/dev/null
 
+    # Persist access details as soon as these exact values have been applied.
+    # Later HTTPS/AWG checks may still fail, but the operator must not lose
+    # access to an already configured panel.
+    save_credentials
+
     "$XUI_BIN" cert \
         -webCert "$cert_dir/fullchain.pem" \
         -webCertKey "$cert_dir/privkey.pem" >/dev/null
@@ -1251,6 +1265,9 @@ save_credentials() {
         printf 'Password: %s\n' "$PANEL_PASSWORD"
     } > "$CREDENTIALS_FILE"
     chmod 600 "$CREDENTIALS_FILE"
+}
+
+mark_installation_complete() {
     rm -f -- "$STATE_FILE"
 }
 
@@ -1260,6 +1277,7 @@ print_credentials() {
     printf '%b\n' "${green}  3AX-UI installation completed${plain}"
     printf '%b\n' "${green}============================================${plain}"
     cat "$CREDENTIALS_FILE"
+    CREDENTIALS_PRINTED=1
     printf '%b\n' "${green}============================================${plain}"
     printf 'Credentials are also stored in %s (root only).\n' "$CREDENTIALS_FILE"
     printf 'Change the username and password after the first login.\n'
@@ -1284,7 +1302,7 @@ main() {
     configure_fail2ban_ssh
     install_amneziawg_stack
 
-    if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
+    if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" && ! -s "$STATE_FILE" ]]; then
         configure_awg_mobile_compatibility
         ensure_enabled_awg_runtime
         print_credentials
@@ -1301,7 +1319,7 @@ main() {
     verify_panel
     configure_awg_mobile_compatibility
     ensure_enabled_awg_runtime
-    save_credentials
+    mark_installation_complete
     print_credentials
 }
 
