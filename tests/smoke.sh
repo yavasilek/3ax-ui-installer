@@ -120,11 +120,13 @@ configure_panel_definition="$(declare -f configure_panel)"
 main_definition="$(declare -f main)"
 on_exit_definition="$(declare -f on_exit)"
 save_credentials_definition="$(declare -f save_credentials)"
+state_guard='! -s "$STATE_FILE"'
+state_cleanup='rm -f -- "$STATE_FILE"'
 grep -Fq 'save_credentials' <<< "$configure_panel_definition"
 grep -Fq 'mark_installation_complete' <<< "$main_definition"
-grep -Fq '! -s "$STATE_FILE"' <<< "$main_definition"
+grep -Fq "$state_guard" <<< "$main_definition"
 grep -Fq 'CREDENTIALS_PRINTED' <<< "$on_exit_definition"
-if grep -Fq 'rm -f -- "$STATE_FILE"' <<< "$save_credentials_definition"; then
+if grep -Fq "$state_cleanup" <<< "$save_credentials_definition"; then
     printf 'Credentials must be saved before the resumable state is removed.\n' >&2
     exit 1
 fi
