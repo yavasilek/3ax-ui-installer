@@ -120,7 +120,10 @@ configure_panel_definition="$(declare -f configure_panel)"
 main_definition="$(declare -f main)"
 on_exit_definition="$(declare -f on_exit)"
 save_credentials_definition="$(declare -f save_credentials)"
+# These are intentional literal fragments from the sourced function bodies.
+# shellcheck disable=SC2016
 state_guard='! -s "$STATE_FILE"'
+# shellcheck disable=SC2016
 state_cleanup='rm -f -- "$STATE_FILE"'
 grep -Fq 'save_credentials' <<< "$configure_panel_definition"
 grep -Fq 'mark_installation_complete' <<< "$main_definition"
