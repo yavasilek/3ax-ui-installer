@@ -2,8 +2,6 @@
 
 set -Eeuo pipefail
 
-[[ "${CI:-}" == "true" ]] && set -x
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$repo_root/install.sh"

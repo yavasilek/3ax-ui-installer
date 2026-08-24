@@ -1455,13 +1455,15 @@ save_credentials() {
 
 load_credentials_file() {
     local credentials_file="$1"
+    local credentials_content=""
     local url=""
     local url_rest=""
 
     [[ -r "$credentials_file" ]] || return 1
-    url="$(sed -n 's/^URL: //p' "$credentials_file" | sed -n '1p')"
-    PANEL_USERNAME="$(sed -n 's/^Username: //p' "$credentials_file" | sed -n '1p')"
-    PANEL_PASSWORD="$(sed -n 's/^Password: //p' "$credentials_file" | sed -n '1p')"
+    credentials_content="$(<"$credentials_file")" || return 1
+    url="$(sed -n 's/^URL: //p' <<< "$credentials_content" | sed -n '1p')"
+    PANEL_USERNAME="$(sed -n 's/^Username: //p' <<< "$credentials_content" | sed -n '1p')"
+    PANEL_PASSWORD="$(sed -n 's/^Password: //p' <<< "$credentials_content" | sed -n '1p')"
 
     [[ "$url" == https://* ]] || return 1
     url_rest="${url#https://}"
