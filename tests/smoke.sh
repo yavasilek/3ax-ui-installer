@@ -65,6 +65,23 @@ assert_fails valid_udp_port 0
 assert_fails valid_udp_port 65536
 assert_fails valid_udp_port invalid
 
+[[ "$(normalize_xui_version 'v1.6.5')" == "1.6.5" ]]
+[[ "$(normalize_xui_version '3AX-UI v1.7.0')" == "1.7.0" ]]
+assert_fails normalize_xui_version "not-a-version"
+version_is_older "1.6.5" "1.7.0"
+assert_fails version_is_older "1.7.0" "1.7.0"
+assert_fails version_is_older "1.8.0" "1.7.0"
+
+load_credentials_file <(printf '%s\n' \
+    'URL: https://185-105-226-75.sslip.io:50409/4799d94d0547a1a6f1fa640c2f87dbf7/' \
+    'Username: admin_test' \
+    'Password: test-password')
+[[ "$DOMAIN" == "185-105-226-75.sslip.io" ]]
+[[ "$PANEL_PORT" == "50409" ]]
+[[ "$WEB_PATH" == "4799d94d0547a1a6f1fa640c2f87dbf7" ]]
+[[ "$PANEL_USERNAME" == "admin_test" ]]
+[[ "$PANEL_PASSWORD" == "test-password" ]]
+
 awg_compatibility_sql="$(write_awg_ipv4_client_compatibility_sql)"
 grep -Fq "CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_INSERT_TRIGGER" <<< "$awg_compatibility_sql"
 grep -Fq "CREATE TRIGGER IF NOT EXISTS $AWG_IPV4_UPDATE_TRIGGER" <<< "$awg_compatibility_sql"
@@ -129,6 +146,8 @@ grep -Fq 'save_credentials' <<< "$configure_panel_definition"
 grep -Fq 'mark_installation_complete' <<< "$main_definition"
 grep -Fq "$state_guard" <<< "$main_definition"
 grep -Fq 'CREDENTIALS_PRINTED' <<< "$on_exit_definition"
+grep -Fq 'maybe_update_upstream_panel' <<< "$main_definition"
+grep -Fq 'rollback_panel_update' <<< "$(declare -f run_upstream_update)"
 if grep -Fq "$state_cleanup" <<< "$save_credentials_definition"; then
     printf 'Credentials must be saved before the resumable state is removed.\n' >&2
     exit 1

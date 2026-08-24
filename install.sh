@@ -3,10 +3,13 @@
 set -Eeuo pipefail
 
 readonly UPSTREAM_INSTALL_URL="https://raw.githubusercontent.com/coinman-dev/3ax-ui/main/install.sh"
+readonly UPSTREAM_UPDATE_URL="https://raw.githubusercontent.com/coinman-dev/3ax-ui/main/update.sh"
+readonly XUI_DIR="/usr/local/x-ui"
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
 readonly XUI_DB="/etc/x-ui/x-ui.db"
 readonly CREDENTIALS_FILE="/root/3ax-ui-credentials.txt"
 readonly STATE_FILE="/root/.3ax-ui-installer-state"
+readonly UPDATE_BACKUP_ROOT="/root/3ax-ui-backups"
 readonly AWG_CONFIG_DIR="/etc/amnezia/amneziawg"
 readonly DEFAULT_AWG_PORT="30526"
 readonly AWG_IPV4_INSERT_TRIGGER="trg_3ax_ipv4_only_client_routes_insert"
@@ -19,6 +22,7 @@ UPSTREAM_SCRIPT=""
 UPSTREAM_LOG=""
 AWG_REPAIR_PENDING=0
 CREDENTIALS_PRINTED=0
+UPDATE_BACKUP_DIR=""
 
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -1137,6 +1141,188 @@ ensure_http_challenge_available() {
     open_firewall_port 80 tcp
 }
 
+normalize_xui_version() {
+    local raw="$1"
+    local version=""
+
+    version="$(grep -Eo 'v?[0-9]+([.][0-9]+){1,3}' <<< "$raw" | sed -n '1p' || true)"
+    [[ "$version" =~ ^v?[0-9]+([.][0-9]+){1,3}$ ]] || return 1
+    printf '%s\n' "${version#v}"
+}
+
+version_is_older() {
+    local current="$1"
+    local latest="$2"
+    local oldest=""
+
+    [[ "$current" != "$latest" ]] || return 1
+    oldest="$(printf '%s\n' "$current" "$latest" | sort -V | sed -n '1p')"
+    [[ "$oldest" == "$current" ]]
+}
+
+fetch_latest_upstream_tag() {
+    local response=""
+    local tag=""
+
+    response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        https://api.github.com/repos/coinman-dev/3ax-ui/releases/latest)" || return 1
+    tag="$(sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$response" | sed -n '1p')"
+    normalize_xui_version "$tag" >/dev/null || return 1
+    printf '%s\n' "$tag"
+}
+
+installed_upstream_version() {
+    local raw=""
+
+    raw="$("$XUI_BIN" -v 2>/dev/null)" || return 1
+    normalize_xui_version "$raw"
+}
+
+create_panel_update_backup() {
+    local target_version="$1"
+    local timestamp=""
+
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$UPDATE_BACKUP_ROOT"
+    chmod 700 "$UPDATE_BACKUP_ROOT"
+    UPDATE_BACKUP_DIR="$(mktemp -d "$UPDATE_BACKUP_ROOT/panel-before-${target_version}-${timestamp}.XXXXXX")"
+    chmod 700 "$UPDATE_BACKUP_DIR"
+
+    cp -a "$XUI_DIR" "$UPDATE_BACKUP_DIR/x-ui" || return 1
+    cp -a /etc/x-ui "$UPDATE_BACKUP_DIR/etc-x-ui" || return 1
+    sqlite3 "$XUI_DB" ".backup '$UPDATE_BACKUP_DIR/etc-x-ui/x-ui.db'" || return 1
+    cp -a /usr/bin/x-ui "$UPDATE_BACKUP_DIR/usr-bin-x-ui" || return 1
+    cp -a /etc/systemd/system/x-ui.service "$UPDATE_BACKUP_DIR/x-ui.service" || return 1
+    if [[ -d "$AWG_CONFIG_DIR" ]]; then
+        cp -a "$AWG_CONFIG_DIR" "$UPDATE_BACKUP_DIR/amneziawg" || return 1
+    fi
+}
+
+rollback_panel_update() {
+    local backup_dir="$1"
+    local failed_suffix=""
+
+    [[ -d "$backup_dir/x-ui" && -d "$backup_dir/etc-x-ui" ]] || return 1
+    [[ -f "$backup_dir/usr-bin-x-ui" && -f "$backup_dir/x-ui.service" ]] || return 1
+    failed_suffix="$(date -u +%Y%m%dT%H%M%SZ)"
+
+    systemctl stop x-ui.service >/dev/null 2>&1 || true
+
+    if [[ -e "$XUI_DIR" ]]; then
+        mv "$XUI_DIR" "$backup_dir/failed-x-ui-$failed_suffix" || return 1
+    fi
+    cp -a "$backup_dir/x-ui" "$XUI_DIR" || return 1
+
+    if [[ -e /etc/x-ui ]]; then
+        mv /etc/x-ui "$backup_dir/failed-etc-x-ui-$failed_suffix" || return 1
+    fi
+    cp -a "$backup_dir/etc-x-ui" /etc/x-ui || return 1
+
+    if [[ -e /usr/bin/x-ui ]]; then
+        mv /usr/bin/x-ui "$backup_dir/failed-usr-bin-x-ui-$failed_suffix" || return 1
+    fi
+    cp -a "$backup_dir/usr-bin-x-ui" /usr/bin/x-ui || return 1
+
+    if [[ -e /etc/systemd/system/x-ui.service ]]; then
+        mv /etc/systemd/system/x-ui.service "$backup_dir/failed-x-ui.service-$failed_suffix" || return 1
+    fi
+    cp -a "$backup_dir/x-ui.service" /etc/systemd/system/x-ui.service || return 1
+
+    if [[ -d "$backup_dir/amneziawg" ]]; then
+        if [[ -e "$AWG_CONFIG_DIR" ]]; then
+            mv "$AWG_CONFIG_DIR" "$backup_dir/failed-amneziawg-$failed_suffix" || return 1
+        fi
+        mkdir -p "$(dirname "$AWG_CONFIG_DIR")"
+        cp -a "$backup_dir/amneziawg" "$AWG_CONFIG_DIR" || return 1
+    fi
+
+    systemctl daemon-reload || return 1
+    systemctl enable x-ui.service >/dev/null 2>&1 || return 1
+    systemctl restart x-ui.service || return 1
+}
+
+run_upstream_update() {
+    local current_version="$1"
+    local latest_tag="$2"
+    local latest_version="$3"
+    local updated_version=""
+
+    UPSTREAM_SCRIPT="$(mktemp /tmp/3ax-ui-upstream-update.XXXXXX)"
+    UPSTREAM_LOG="$(mktemp /tmp/3ax-ui-upstream-update-log.XXXXXX)"
+    chmod 600 "$UPSTREAM_SCRIPT" "$UPSTREAM_LOG"
+    curl -fsSL "$UPSTREAM_UPDATE_URL" -o "$UPSTREAM_SCRIPT" || \
+        die "Cannot download the official 3AX-UI update script."
+
+    create_panel_update_backup "$latest_version" || \
+        die "Cannot create a complete 3AX-UI backup before updating."
+    info "Updating 3AX-UI v$current_version -> $latest_tag"
+    info "Rollback copy: $UPDATE_BACKUP_DIR"
+
+    if ! bash "$UPSTREAM_SCRIPT" </dev/null >"$UPSTREAM_LOG" 2>&1; then
+        sed -E 's/(Username|Password):.*/\1: [REDACTED]/I' "$UPSTREAM_LOG" | tail -n 80 >&2 || true
+        if rollback_panel_update "$UPDATE_BACKUP_DIR"; then
+            die "The official updater failed; 3AX-UI was restored from $UPDATE_BACKUP_DIR."
+        fi
+        die "The official updater failed and automatic rollback also failed. Backup: $UPDATE_BACKUP_DIR"
+    fi
+
+    updated_version="$(installed_upstream_version)" || true
+    if [[ -z "$updated_version" ]] || version_is_older "$updated_version" "$latest_version"; then
+        if rollback_panel_update "$UPDATE_BACKUP_DIR"; then
+            die "The update did not install $latest_tag; the previous version was restored."
+        fi
+        die "The update version check and automatic rollback failed. Backup: $UPDATE_BACKUP_DIR"
+    fi
+
+    if ! (
+        trap - EXIT
+        verify_panel
+        configure_awg_mobile_compatibility
+        ensure_enabled_awg_runtime
+    ); then
+        if rollback_panel_update "$UPDATE_BACKUP_DIR"; then
+            die "Post-update checks failed; the previous version was restored."
+        fi
+        die "Post-update checks and automatic rollback failed. Backup: $UPDATE_BACKUP_DIR"
+    fi
+
+    info "3AX-UI was updated successfully: v$current_version -> v$updated_version"
+}
+
+maybe_update_upstream_panel() {
+    local current_version=""
+    local latest_tag=""
+    local latest_version=""
+
+    case "${THREE_AX_AUTO_UPDATE:-1}" in
+        0)
+            info "Automatic 3AX-UI update is disabled (THREE_AX_AUTO_UPDATE=0)"
+            return
+            ;;
+        1) ;;
+        *) die "THREE_AX_AUTO_UPDATE must be 0 or 1." ;;
+    esac
+
+    current_version="$(installed_upstream_version)" || {
+        warn "Cannot determine the installed 3AX-UI version; automatic update was skipped."
+        return
+    }
+    latest_tag="$(fetch_latest_upstream_tag)" || {
+        warn "Cannot determine the latest stable 3AX-UI version; automatic update was skipped."
+        return
+    }
+    latest_version="$(normalize_xui_version "$latest_tag")" || \
+        die "The latest 3AX-UI release has an invalid version tag."
+
+    if version_is_older "$current_version" "$latest_version"; then
+        run_upstream_update "$current_version" "$latest_tag" "$latest_version"
+    elif [[ "$current_version" == "$latest_version" ]]; then
+        info "3AX-UI is already up to date (v$current_version)"
+    else
+        warn "Installed 3AX-UI v$current_version is newer than stable $latest_tag; downgrade was skipped."
+    fi
+}
+
 install_upstream_panel() {
     [[ -x "$XUI_BIN" ]] && return
 
@@ -1267,6 +1453,36 @@ save_credentials() {
     chmod 600 "$CREDENTIALS_FILE"
 }
 
+load_credentials_file() {
+    local credentials_file="$1"
+    local url=""
+    local url_rest=""
+
+    [[ -r "$credentials_file" ]] || return 1
+    url="$(sed -n 's/^URL: //p' "$credentials_file" | sed -n '1p')"
+    PANEL_USERNAME="$(sed -n 's/^Username: //p' "$credentials_file" | sed -n '1p')"
+    PANEL_PASSWORD="$(sed -n 's/^Password: //p' "$credentials_file" | sed -n '1p')"
+
+    [[ "$url" == https://* ]] || return 1
+    url_rest="${url#https://}"
+    [[ "$url_rest" == *:*/* ]] || return 1
+    DOMAIN="${url_rest%%:*}"
+    url_rest="${url_rest#*:}"
+    PANEL_PORT="${url_rest%%/*}"
+    WEB_PATH="${url_rest#*/}"
+    WEB_PATH="${WEB_PATH%/}"
+
+    valid_domain "$DOMAIN" || return 1
+    [[ "$PANEL_PORT" =~ ^[0-9]+$ && "$PANEL_PORT" -ge 1 && "$PANEL_PORT" -le 65535 ]] || return 1
+    [[ "$WEB_PATH" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    [[ -n "$PANEL_USERNAME" && -n "$PANEL_PASSWORD" ]] || return 1
+}
+
+load_saved_credentials() {
+    load_credentials_file "$CREDENTIALS_FILE" || \
+        die "Cannot read the saved 3AX-UI URL and credentials from $CREDENTIALS_FILE."
+}
+
 mark_installation_complete() {
     rm -f -- "$STATE_FILE"
 }
@@ -1303,8 +1519,11 @@ main() {
     install_amneziawg_stack
 
     if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" && ! -s "$STATE_FILE" ]]; then
+        load_saved_credentials
+        maybe_update_upstream_panel
         configure_awg_mobile_compatibility
         ensure_enabled_awg_runtime
+        verify_panel
         print_credentials
         exit 0
     fi
