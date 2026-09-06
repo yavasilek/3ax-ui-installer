@@ -38,6 +38,12 @@ grep -Fxq 'Suites: noble' <<< "$repository_definition"
 grep -Fxq 'Architectures: amd64' <<< "$repository_definition"
 grep -Fxq "Signed-By: $AMNEZIA_PPA_KEYRING" <<< "$repository_definition"
 
+[[ "$(normalize_amneziawg_version 'amneziawg-tools v3.1.20260812')" == "3.1.20260812" ]]
+[[ "$(normalize_amneziawg_version '3.1.20260906')" == "3.1.20260906" ]]
+assert_fails normalize_amneziawg_version 'unknown'
+amneziawg_version_supports_3_1 'v3.1.20260812'
+assert_fails amneziawg_version_supports_3_1 'v3.0.20260805'
+
 normalized_ports="$(printf '%s\n' 2222 22 invalid 22 0 65535 65536 | normalize_ssh_ports)"
 [[ "$normalized_ports" == "22,2222,65535" ]]
 
@@ -130,6 +136,10 @@ fi
 awg_smoke_config="$(write_awg_smoke_config test-private-key eth0 awg3axtest)"
 grep -Fxq 'H1 = 5-1005' <<< "$awg_smoke_config"
 grep -Fxq 'I1 = <r 32>' <<< "$awg_smoke_config"
+grep -Fxq 'HeaderProtectionKey = test-private-key' <<< "$awg_smoke_config"
+grep -Fxq 'ContentPaddingAddition = 10-100' <<< "$awg_smoke_config"
+grep -Fxq 'RandomTrailers = on' <<< "$awg_smoke_config"
+grep -Fxq 'DisableCookies = on' <<< "$awg_smoke_config"
 grep -Fq 'iptables -w -t nat -A POSTROUTING -s 192.0.2.0/31 -o eth0 -j MASQUERADE' <<< "$awg_smoke_config"
 grep -Fq 'iptables -w -A FORWARD -i awg3axtest -j ACCEPT' <<< "$awg_smoke_config"
 
@@ -148,6 +158,8 @@ grep -Fq "$state_guard" <<< "$main_definition"
 grep -Fq 'CREDENTIALS_PRINTED' <<< "$on_exit_definition"
 grep -Fq 'maybe_update_upstream_panel' <<< "$main_definition"
 grep -Fq 'rollback_panel_update' <<< "$(declare -f run_upstream_update)"
+grep -Fq 'amneziawg_available_updates' <<< "$(declare -f install_amneziawg_stack)"
+grep -Fq 'reload_amneziawg_module_if_needed' <<< "$(declare -f install_amneziawg_stack)"
 if grep -Fq "$state_cleanup" <<< "$save_credentials_definition"; then
     printf 'Credentials must be saved before the resumable state is removed.\n' >&2
     exit 1

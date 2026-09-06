@@ -17,6 +17,7 @@ readonly AWG_IPV4_UPDATE_TRIGGER="trg_3ax_ipv4_only_client_routes_update"
 readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
 readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
 readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
+readonly -a AMNEZIAWG_PACKAGES=(amneziawg amneziawg-dkms amneziawg-tools)
 
 UPSTREAM_SCRIPT=""
 UPSTREAM_LOG=""
@@ -248,14 +249,168 @@ configure_amnezia_repository() {
     info "Configured the signed Amnezia PPA ($suite, $architecture)"
 }
 
+normalize_amneziawg_version() {
+    local raw="$1"
+    local version=""
+
+    version="$(grep -Eo 'v?[0-9]+([.][0-9]+){1,3}' <<< "$raw" | sed -n '1p' || true)"
+    [[ "$version" =~ ^v?[0-9]+([.][0-9]+){1,3}$ ]] || return 1
+    printf '%s\n' "${version#v}"
+}
+
+amneziawg_version_supports_3_1() {
+    local version=""
+
+    version="$(normalize_amneziawg_version "$1")" || return 1
+    dpkg --compare-versions "$version" ge "3.1"
+}
+
+installed_amneziawg_tools_version() {
+    local raw=""
+
+    raw="$(awg --version 2>/dev/null)" || return 1
+    normalize_amneziawg_version "$raw"
+}
+
+installed_amneziawg_module_version() {
+    local raw=""
+
+    raw="$(modinfo -F version amneziawg 2>/dev/null | sed -n '1p')"
+    normalize_amneziawg_version "$raw"
+}
+
+loaded_amneziawg_module_version() {
+    local raw=""
+
+    [[ -r /sys/module/amneziawg/version ]] || return 1
+    raw="$(< /sys/module/amneziawg/version)"
+    normalize_amneziawg_version "$raw"
+}
+
+amneziawg_available_updates() {
+    local package
+    local installed_version
+    local candidate_version
+
+    for package in "${AMNEZIAWG_PACKAGES[@]}"; do
+        candidate_version="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null \
+            | awk '$1 == "Candidate:" {print $2; exit}')"
+        [[ -n "$candidate_version" && "$candidate_version" != "(none)" ]] || continue
+        if ! installed_version="$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null)"; then
+            printf '%s\t%s\t%s\n' "$package" "not-installed" "$candidate_version"
+            continue
+        fi
+        if dpkg --compare-versions "$installed_version" lt "$candidate_version"; then
+            printf '%s\t%s\t%s\n' "$package" "$installed_version" "$candidate_version"
+        fi
+    done
+}
+
+active_amneziawg_interfaces() {
+    command -v awg >/dev/null 2>&1 || return 0
+    awg show interfaces 2>/dev/null | tr ' ' '\n' | sed '/^$/d'
+}
+
+active_amneziawg_interfaces_are_restorable() {
+    local interface_name
+    local config_file
+
+    while IFS= read -r interface_name; do
+        [[ -n "$interface_name" ]] || continue
+        valid_awg_interface_name "$interface_name" || return 1
+        config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+        [[ -s "$config_file" ]] || {
+            warn "Cannot safely reload active interface $interface_name: $config_file is missing."
+            return 1
+        }
+    done < <(active_amneziawg_interfaces)
+}
+
+restore_amneziawg_interfaces() {
+    local interface_name
+    local config_file
+    local result=0
+
+    for interface_name in "$@"; do
+        awg show "$interface_name" >/dev/null 2>&1 && continue
+        config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+        awg-quick up "$config_file" >/dev/null 2>&1 || result=1
+    done
+    return "$result"
+}
+
+reload_amneziawg_module_if_needed() {
+    local force_reload="${1:-0}"
+    local installed_version=""
+    local loaded_version=""
+    local interface_name
+    local config_file
+    local xui_was_active=0
+    local restore_result=0
+    local -a active_interfaces=()
+
+    installed_version="$(installed_amneziawg_module_version)" || return 1
+    loaded_version="$(loaded_amneziawg_module_version)" || true
+    if [[ "$force_reload" -eq 0 && "$loaded_version" == "$installed_version" ]]; then
+        return
+    fi
+
+    mapfile -t active_interfaces < <(active_amneziawg_interfaces)
+    active_amneziawg_interfaces_are_restorable || return 1
+    systemctl is-active --quiet x-ui.service && xui_was_active=1
+
+    if [[ -n "$loaded_version" && "$loaded_version" == "$installed_version" ]]; then
+        info "Reloading the updated AmneziaWG kernel module (v$installed_version)"
+    else
+        info "Loading the updated AmneziaWG kernel module${loaded_version:+ (v$loaded_version -> v$installed_version)}"
+    fi
+    if [[ "$xui_was_active" -eq 1 ]]; then
+        systemctl stop x-ui.service || return 1
+    fi
+
+    for interface_name in "${active_interfaces[@]}"; do
+        if awg show "$interface_name" >/dev/null 2>&1; then
+            config_file="$AWG_CONFIG_DIR/$interface_name.conf"
+            if ! awg-quick down "$config_file" >/dev/null 2>&1; then
+                restore_amneziawg_interfaces "${active_interfaces[@]}" || true
+                [[ "$xui_was_active" -eq 0 ]] || systemctl restart x-ui.service || true
+                return 1
+            fi
+        fi
+    done
+
+    if ! modprobe -r amneziawg || ! modprobe amneziawg; then
+        modprobe amneziawg >/dev/null 2>&1 || true
+        restore_amneziawg_interfaces "${active_interfaces[@]}" || true
+        [[ "$xui_was_active" -eq 0 ]] || systemctl restart x-ui.service || true
+        return 1
+    fi
+
+    restore_amneziawg_interfaces "${active_interfaces[@]}" || restore_result=1
+    if [[ "$xui_was_active" -eq 1 ]] && ! systemctl restart x-ui.service; then
+        restore_result=1
+    fi
+    [[ "$restore_result" -eq 0 ]] || return 1
+
+    loaded_version="$(loaded_amneziawg_module_version)" || return 1
+    [[ "$loaded_version" == "$installed_version" ]]
+}
+
 amneziawg_is_ready() {
     local private_key
     local public_key
     local test_interface="awg3ax$$"
+    local tools_version
+    local module_version
 
     command -v awg >/dev/null 2>&1 || return 1
     command -v awg-quick >/dev/null 2>&1 || return 1
     modprobe amneziawg >/dev/null 2>&1 || return 1
+
+    tools_version="$(installed_amneziawg_tools_version)" || return 1
+    module_version="$(loaded_amneziawg_module_version)" || return 1
+    amneziawg_version_supports_3_1 "$tools_version" || return 1
+    amneziawg_version_supports_3_1 "$module_version" || return 1
 
     private_key="$(awg genkey 2>/dev/null)"
     [[ -n "$private_key" ]] || return 1
@@ -283,13 +438,17 @@ Jmin = 40
 Jmax = 90
 S1 = 56
 S2 = 88
-S3 = 12
-S4 = 8
+S3 = 24
+S4 = 24
 H1 = 5-1005
 H2 = 2005-3005
 H3 = 4005-5005
 H4 = 6005-7005
 I1 = <r 32>
+HeaderProtectionKey = $private_key
+ContentPaddingAddition = 10-100
+RandomTrailers = on
+DisableCookies = on
 PostUp = iptables -w -t nat -A POSTROUTING -s 192.0.2.0/31 -o $external_interface -j MASQUERADE; iptables -w -A FORWARD -i $test_interface -j ACCEPT; iptables -w -A FORWARD -o $test_interface -j ACCEPT; sysctl -q -w net.ipv4.ip_forward=1
 PostDown = iptables -w -t nat -D POSTROUTING -s 192.0.2.0/31 -o $external_interface -j MASQUERADE; iptables -w -D FORWARD -i $test_interface -j ACCEPT; iptables -w -D FORWARD -o $test_interface -j ACCEPT
 EOF
@@ -353,25 +512,60 @@ amneziawg_server_smoke_test() {
 install_amneziawg_stack() {
     local kernel_version
     local headers_package
-
-    if [[ "$AWG_REPAIR_PENDING" -eq 0 ]] && \
-        amneziawg_is_ready && amneziawg_server_smoke_test; then
-        info "AmneziaWG passed the full AWG 2.0 server startup test"
-        return
-    fi
+    local runtime_ready=0
+    local package_update
+    local package
+    local installed_version
+    local candidate_version
+    local tools_version
+    local module_version
+    local module_package_updated=0
+    local -a available_updates=()
+    local -a apt_install_args=(-y -q)
 
     command -v curl >/dev/null 2>&1 || die "curl is required to repair AmneziaWG."
     command -v gpg >/dev/null 2>&1 || die "gpg is required to repair AmneziaWG."
+
+    if [[ "$AWG_REPAIR_PENDING" -eq 0 ]] && \
+        amneziawg_is_ready && amneziawg_server_smoke_test; then
+        runtime_ready=1
+    fi
 
     sanitize_legacy_amnezia_sources
     configure_amnezia_repository
 
     kernel_version="$(uname -r)"
     headers_package="linux-headers-${kernel_version}"
-    info "Installing AmneziaWG tools and DKMS module for kernel $kernel_version"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
-    apt-get install -y -q --reinstall \
+    mapfile -t available_updates < <(amneziawg_available_updates)
+
+    if [[ "$runtime_ready" -eq 1 && ${#available_updates[@]} -eq 0 ]]; then
+        tools_version="$(installed_amneziawg_tools_version)"
+        module_version="$(loaded_amneziawg_module_version)"
+        info "AmneziaWG is up to date (tools v$tools_version, module v$module_version)"
+        info "AmneziaWG passed the full AWG 3.1 server startup test"
+        return
+    fi
+
+    active_amneziawg_interfaces_are_restorable || \
+        die "AmneziaWG updates were not installed because an active interface cannot be restored safely."
+
+    if [[ ${#available_updates[@]} -gt 0 ]]; then
+        info "AmneziaWG updates are available:"
+        for package_update in "${available_updates[@]}"; do
+            IFS=$'\t' read -r package installed_version candidate_version <<< "$package_update"
+            printf '  %s: %s -> %s\n' "$package" "$installed_version" "$candidate_version"
+            [[ "$package" != "amneziawg-dkms" ]] || module_package_updated=1
+        done
+    else
+        info "Installing or repairing AmneziaWG 3.1 for kernel $kernel_version"
+    fi
+    if [[ "$runtime_ready" -ne 1 ]]; then
+        apt_install_args+=(--reinstall)
+        module_package_updated=1
+    fi
+    apt-get install "${apt_install_args[@]}" \
         build-essential \
         dkms \
         "$headers_package" \
@@ -385,14 +579,19 @@ install_amneziawg_stack() {
     dkms autoinstall -k "$kernel_version"
     depmod -a "$kernel_version"
     printf 'amneziawg\n' > /etc/modules-load.d/amneziawg.conf
+    reload_amneziawg_module_if_needed "$module_package_updated" || \
+        die "The updated AmneziaWG module could not be loaded without losing the active configuration."
 
     if ! amneziawg_is_ready || ! amneziawg_server_smoke_test; then
         dkms status >&2 || true
         modinfo amneziawg >&2 || true
-        die "AmneziaWG was installed but a complete AWG 2.0 server could not be started."
+        die "AmneziaWG was installed but a complete AWG 3.1 server could not be started."
     fi
 
-    info "AmneziaWG passed the full AWG 2.0 server startup test"
+    tools_version="$(installed_amneziawg_tools_version)"
+    module_version="$(loaded_amneziawg_module_version)"
+    info "AmneziaWG is ready (tools v$tools_version, module v$module_version)"
+    info "AmneziaWG passed the full AWG 3.1 server startup test"
 }
 
 normalize_ssh_ports() {
