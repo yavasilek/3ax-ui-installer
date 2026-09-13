@@ -57,6 +57,11 @@ mapfile -t ubuntu_header_packages < <(ubuntu_kernel_header_package_names '6.8.0-
 assert_fails ubuntu_kernel_header_package_names 'invalid kernel'
 assert_fails ubuntu_snapshot_package_url invalid main linux package 1.0 amd64
 assert_fails ubuntu_snapshot_package_url 20240605T000000Z '../bad' linux package 1.0 amd64
+[[ "$(urlencode_path_component 'linux-headers-6.12.95+deb13-amd64')" == \
+    'linux-headers-6.12.95%2Bdeb13-amd64' ]]
+[[ "$(debian_snapshot_file_url 2193f987a83fd83c2a80eb247025e40ff513ac5a)" == \
+    'https://snapshot.debian.org/file/2193f987a83fd83c2a80eb247025e40ff513ac5a' ]]
+assert_fails debian_snapshot_file_url invalid
 
 normalized_ports="$(printf '%s\n' 2222 22 invalid 22 0 65535 65536 | normalize_ssh_ports)"
 [[ "$normalized_ports" == "22,2222,65535" ]]
@@ -179,6 +184,9 @@ grep -Fq 'reload_amneziawg_module_if_needed' <<< "$(declare -f install_amneziawg
 grep -Fq 'ensure_running_kernel_headers' <<< "$(declare -f install_amneziawg_stack)"
 grep -Fq 'validate_deb_identity' <<< "$(declare -f install_archived_ubuntu_kernel_headers)"
 grep -Fq 'ubuntu_snapshot_locator' <<< "$(declare -f install_archived_ubuntu_kernel_headers)"
+grep -Fq 'debian_snapshot_binary_version' <<< "$(declare -f install_archived_debian_kernel_headers)"
+grep -Fq 'debian_snapshot_kernel_dependencies' <<< "$(declare -f install_archived_debian_kernel_headers)"
+grep -Fq 'install_archived_debian_kernel_headers' <<< "$(declare -f ensure_running_kernel_headers)"
 grep -Fq 'systemctl stop nginx.service' <<< "$http_challenge_definition"
 grep -Fq 'restore_http_challenge_nginx' <<< "$http_challenge_definition"
 grep -Fq 'stop-3ax-ui-nginx' <<< "$renewal_definition"
