@@ -19,6 +19,7 @@ readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
 readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
 readonly LAUNCHPAD_API_ROOT="https://api.launchpad.net/1.0"
 readonly UBUNTU_SNAPSHOT_ARCHIVE="https://snapshot.ubuntu.com/ubuntu"
+readonly DEBIAN_SNAPSHOT_ROOT="https://snapshot.debian.org"
 readonly -a AMNEZIAWG_PACKAGES=(amneziawg amneziawg-dkms amneziawg-tools)
 
 UPSTREAM_SCRIPT=""
@@ -636,6 +637,217 @@ validate_deb_identity() {
     [[ "$actual_architecture" == "$expected_architecture" ]]
 }
 
+urlencode_path_component() {
+    local value="$1"
+
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c 'import sys; from urllib.parse import quote; print(quote(sys.argv[1], safe=""))' "$value"
+}
+
+debian_snapshot_binary_version() {
+    local package="$1"
+    local preferred_version="${2:-}"
+    local encoded_package
+
+    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
+    encoded_package="$(urlencode_path_component "$package")" || return 1
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 15 --max-time 60 \
+        "$DEBIAN_SNAPSHOT_ROOT/mr/binary/$encoded_package/" | python3 -c '
+import json
+import sys
+
+preferred = sys.argv[1]
+versions = []
+for entry in json.load(sys.stdin).get("result", []):
+    version = entry.get("binary_version")
+    if version and version not in versions:
+        versions.append(version)
+if preferred and preferred in versions:
+    print(preferred)
+elif len(versions) == 1:
+    print(versions[0])
+else:
+    raise SystemExit(1)
+' "$preferred_version"
+}
+
+debian_snapshot_binary_locator() {
+    local package="$1"
+    local package_version="$2"
+    local architecture="$3"
+    local encoded_package
+    local encoded_version
+
+    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
+    [[ "$package_version" =~ ^[0-9A-Za-z.+~:-]+$ ]] || return 1
+    [[ "$architecture" =~ ^[a-z0-9]+$ ]] || return 1
+    encoded_package="$(urlencode_path_component "$package")" || return 1
+    encoded_version="$(urlencode_path_component "$package_version")" || return 1
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 15 --max-time 60 \
+        "$DEBIAN_SNAPSHOT_ROOT/mr/binary/$encoded_package/$encoded_version/binfiles" | python3 -c '
+import json
+import re
+import sys
+
+requested_architecture = sys.argv[1]
+entries = json.load(sys.stdin).get("result", [])
+selected = next(
+    (entry for entry in entries if entry.get("architecture") == requested_architecture),
+    None,
+)
+if selected is None:
+    selected = next(
+        (entry for entry in entries if entry.get("architecture") == "all"),
+        None,
+    )
+if selected is None or not re.fullmatch(r"[0-9a-f]{40}", selected.get("hash", "")):
+    raise SystemExit(1)
+print(selected["architecture"], selected["hash"], sep="\t")
+' "$architecture"
+}
+
+debian_snapshot_file_url() {
+    local sha1="$1"
+
+    [[ "$sha1" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s/file/%s\n' "$DEBIAN_SNAPSHOT_ROOT" "$sha1"
+}
+
+debian_snapshot_kernel_dependencies() {
+    local file="$1"
+
+    command -v python3 >/dev/null 2>&1 || return 1
+    {
+        dpkg-deb -f "$file" Pre-Depends 2>/dev/null || true
+        dpkg-deb -f "$file" Depends 2>/dev/null || true
+    } | python3 -c '
+import re
+import sys
+
+seen = set()
+for dependency in sys.stdin.read().replace("\n", " ").split(","):
+    for alternative in dependency.split("|"):
+        match = re.match(
+            r"\s*([a-z0-9][a-z0-9+.-]*)(?::[a-z0-9]+)?"
+            r"(?:\s*\(\s*(=|>=|<=|>>|<<)\s*([^\s)]+)\s*\))?",
+            alternative,
+        )
+        if not match:
+            continue
+        package, operator, version = match.groups()
+        if not package.startswith(("linux-headers-", "linux-kbuild-")):
+            continue
+        if package in seen:
+            break
+        seen.add(package)
+        print(package, version if operator == "=" else "", sep="\t")
+        break
+'
+}
+
+debian_running_kernel_package_version() {
+    local kernel_version="$1"
+    local image_package
+    local package_version
+
+    for image_package in \
+        "linux-image-$kernel_version" \
+        "linux-image-$kernel_version-unsigned"; do
+        package_version="$(dpkg-query -W -f='${Version}' "$image_package" 2>/dev/null)" || continue
+        [[ -n "$package_version" ]] || continue
+        printf '%s\n' "$package_version"
+        return
+    done
+    return 1
+}
+
+install_archived_debian_kernel_headers() {
+    local kernel_version="$1"
+    local architecture
+    local image_version=""
+    local headers_package="linux-headers-$kernel_version"
+    local package
+    local requested_version
+    local package_version
+    local package_architecture
+    local sha1
+    local locator
+    local package_url
+    local package_file
+    local dependency
+    local dependency_version
+    local temp_dir
+    local queue_index=0
+    local file_index=0
+    local -a queue_packages=()
+    local -a queue_versions=()
+    local -a downloaded_files=()
+    local -A seen_packages=()
+
+    [[ "${ID:-}" == "debian" ]] || return 1
+    [[ "$kernel_version" =~ ^[0-9A-Za-z.+~-]+$ ]] || return 1
+    architecture="$(dpkg --print-architecture)"
+    image_version="$(debian_running_kernel_package_version "$kernel_version" || true)"
+    package_version="$(debian_snapshot_binary_version "$headers_package" "$image_version")" || return 1
+    queue_packages+=("$headers_package")
+    queue_versions+=("$package_version")
+    temp_dir="$(mktemp -d /tmp/3ax-ui-debian-kernel-headers.XXXXXX)"
+    info "The repository no longer indexes headers for $kernel_version; using Debian Snapshot"
+
+    while [[ $queue_index -lt ${#queue_packages[@]} ]]; do
+        package="${queue_packages[$queue_index]}"
+        requested_version="${queue_versions[$queue_index]}"
+        queue_index=$((queue_index + 1))
+        [[ -z "${seen_packages[$package]:-}" ]] || continue
+        seen_packages["$package"]=1
+
+        package_version="$(debian_snapshot_binary_version \
+            "$package" "${requested_version:-$image_version}")" || {
+            rm -rf -- "$temp_dir"
+            return 1
+        }
+        locator="$(debian_snapshot_binary_locator \
+            "$package" "$package_version" "$architecture")" || {
+            rm -rf -- "$temp_dir"
+            return 1
+        }
+        IFS=$'\t' read -r package_architecture sha1 <<< "$locator"
+        package_url="$(debian_snapshot_file_url "$sha1")" || {
+            rm -rf -- "$temp_dir"
+            return 1
+        }
+        file_index=$((file_index + 1))
+        package_file="$temp_dir/package-$file_index.deb"
+        if ! curl -fL --retry 5 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 15 --max-time 300 \
+            -o "$package_file" "$package_url" || \
+            ! validate_deb_identity \
+                "$package_file" "$package" "$package_version" "$package_architecture"; then
+            warn "A Debian Snapshot kernel-header package failed download or identity validation."
+            rm -rf -- "$temp_dir"
+            return 1
+        fi
+        downloaded_files+=("$package_file")
+
+        while IFS=$'\t' read -r dependency dependency_version; do
+            [[ -n "$dependency" ]] || continue
+            [[ -z "${seen_packages[$dependency]:-}" ]] || continue
+            queue_packages+=("$dependency")
+            queue_versions+=("$dependency_version")
+        done < <(debian_snapshot_kernel_dependencies "$package_file")
+    done
+
+    if [[ ${#downloaded_files[@]} -eq 0 ]] || \
+        ! apt-get install -y -q "${downloaded_files[@]}"; then
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    rm -rf -- "$temp_dir"
+    [[ -s "/lib/modules/$kernel_version/build/Makefile" ]]
+}
+
 install_archived_ubuntu_kernel_headers() {
     local kernel_version="$1"
     local package_version
@@ -715,6 +927,7 @@ ensure_running_kernel_headers() {
     fi
 
     install_archived_ubuntu_kernel_headers "$kernel_version" || \
+        install_archived_debian_kernel_headers "$kernel_version" || \
         die "Headers for the running kernel $kernel_version are unavailable. Install a supported kernel and rerun this installer."
 }
 
