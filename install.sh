@@ -17,6 +17,7 @@ readonly AWG_IPV4_UPDATE_TRIGGER="trg_3ax_ipv4_only_client_routes_update"
 readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
 readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
 readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
+readonly UBUNTU_PRIMARY_ARCHIVE="https://launchpad.net/ubuntu/+archive/primary/+files"
 readonly -a AMNEZIAWG_PACKAGES=(amneziawg amneziawg-dkms amneziawg-tools)
 
 UPSTREAM_SCRIPT=""
@@ -509,9 +510,138 @@ amneziawg_server_smoke_test() {
     cleanup_awg_smoke "$config_file" "$test_interface" "$external_interface"
 }
 
+apt_package_candidate_version() {
+    LC_ALL=C apt-cache policy "$1" 2>/dev/null \
+        | awk '$1 == "Candidate:" && $2 != "(none)" {print $2; exit}'
+}
+
+ubuntu_kernel_header_package_names() {
+    local kernel_version="$1"
+    local kernel_abi="${kernel_version%-*}"
+
+    [[ "$kernel_version" =~ ^[0-9A-Za-z.+~-]+$ ]] || return 1
+    [[ "$kernel_abi" != "$kernel_version" ]] || return 1
+    printf 'linux-headers-%s\n' "$kernel_abi"
+    printf 'linux-headers-%s\n' "$kernel_version"
+}
+
+ubuntu_running_kernel_package_version() {
+    local kernel_version="$1"
+    local image_package
+    local package_version
+
+    for image_package in \
+        "linux-image-$kernel_version" \
+        "linux-image-unsigned-$kernel_version"; do
+        package_version="$(dpkg-query -W -f='${Version}' "$image_package" 2>/dev/null)" || continue
+        [[ -n "$package_version" ]] || continue
+        printf '%s\n' "$package_version"
+        return
+    done
+    return 1
+}
+
+ubuntu_primary_archive_package_url() {
+    local package="$1"
+    local package_version="${2#*:}"
+    local architecture="$3"
+
+    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || return 1
+    [[ "$package_version" =~ ^[0-9A-Za-z.+~:-]+$ ]] || return 1
+    [[ "$architecture" =~ ^[a-z0-9]+$ ]] || return 1
+    printf '%s/%s_%s_%s.deb\n' \
+        "$UBUNTU_PRIMARY_ARCHIVE" "$package" "$package_version" "$architecture"
+}
+
+validate_deb_identity() {
+    local file="$1"
+    local expected_package="$2"
+    local expected_version="$3"
+    local expected_architecture="$4"
+    local actual_package
+    local actual_version
+    local actual_architecture
+
+    actual_package="$(dpkg-deb -f "$file" Package 2>/dev/null)" || return 1
+    actual_version="$(dpkg-deb -f "$file" Version 2>/dev/null)" || return 1
+    actual_architecture="$(dpkg-deb -f "$file" Architecture 2>/dev/null)" || return 1
+
+    [[ "$actual_package" == "$expected_package" ]] || return 1
+    dpkg --compare-versions "$actual_version" eq "$expected_version" || return 1
+    [[ "$actual_architecture" == "$expected_architecture" ]]
+}
+
+install_archived_ubuntu_kernel_headers() {
+    local kernel_version="$1"
+    local package_version
+    local architecture
+    local base_package
+    local flavor_package
+    local base_file
+    local flavor_file
+    local base_url
+    local flavor_url
+    local temp_dir
+    local -a header_packages=()
+
+    [[ "${ID:-}" == "ubuntu" ]] || return 1
+    package_version="$(ubuntu_running_kernel_package_version "$kernel_version")" || return 1
+    architecture="$(dpkg --print-architecture)"
+    mapfile -t header_packages < <(ubuntu_kernel_header_package_names "$kernel_version")
+    [[ ${#header_packages[@]} -eq 2 ]] || return 1
+    base_package="${header_packages[0]}"
+    flavor_package="${header_packages[1]}"
+    base_url="$(ubuntu_primary_archive_package_url "$base_package" "$package_version" all)" || return 1
+    flavor_url="$(ubuntu_primary_archive_package_url "$flavor_package" "$package_version" "$architecture")" || return 1
+
+    temp_dir="$(mktemp -d /tmp/3ax-ui-kernel-headers.XXXXXX)"
+    base_file="$temp_dir/$base_package.deb"
+    flavor_file="$temp_dir/$flavor_package.deb"
+    info "The repository no longer indexes headers for $kernel_version; using Ubuntu's official package archive"
+
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 300 \
+        -o "$base_file" "$base_url" || \
+        ! curl -fL --retry 3 --connect-timeout 15 --max-time 300 \
+        -o "$flavor_file" "$flavor_url"; then
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    if ! validate_deb_identity "$base_file" "$base_package" "$package_version" all || \
+        ! validate_deb_identity "$flavor_file" "$flavor_package" "$package_version" "$architecture"; then
+        warn "Downloaded kernel-header packages failed identity validation."
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    if ! apt-get install -y -q "$base_file" "$flavor_file"; then
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    rm -rf -- "$temp_dir"
+    [[ -s "/lib/modules/$kernel_version/build/Makefile" ]]
+}
+
+ensure_running_kernel_headers() {
+    local kernel_version="$1"
+    local headers_package="linux-headers-$kernel_version"
+    local candidate_version
+
+    if [[ -s "/lib/modules/$kernel_version/build/Makefile" ]]; then
+        return
+    fi
+
+    candidate_version="$(apt_package_candidate_version "$headers_package")"
+    if [[ -n "$candidate_version" ]] && \
+        apt-get install -y -q "$headers_package" && \
+        [[ -s "/lib/modules/$kernel_version/build/Makefile" ]]; then
+        return
+    fi
+
+    install_archived_ubuntu_kernel_headers "$kernel_version" || \
+        die "Headers for the running kernel $kernel_version are unavailable. Install a supported kernel and rerun this installer."
+}
+
 install_amneziawg_stack() {
     local kernel_version
-    local headers_package
     local runtime_ready=0
     local package_update
     local package
@@ -535,9 +665,9 @@ install_amneziawg_stack() {
     configure_amnezia_repository
 
     kernel_version="$(uname -r)"
-    headers_package="linux-headers-${kernel_version}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
+    ensure_running_kernel_headers "$kernel_version"
     mapfile -t available_updates < <(amneziawg_available_updates)
 
     if [[ "$runtime_ready" -eq 1 && ${#available_updates[@]} -eq 0 ]]; then
@@ -568,7 +698,6 @@ install_amneziawg_stack() {
     apt-get install "${apt_install_args[@]}" \
         build-essential \
         dkms \
-        "$headers_package" \
         iptables \
         ndppd \
         sqlite3 \
