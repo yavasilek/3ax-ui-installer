@@ -206,11 +206,14 @@ fi
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$mock_bin/dpkg"
 PATH="$mock_bin:$PATH" check_package_manager_health
 
+# Variables below intentionally expand later inside the generated mock scripts.
+# shellcheck disable=SC2016
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ -e "${MOCK_NGINX_ACTIVE:?}" ]]; then' \
     '    printf "LISTEN 0 511 0.0.0.0:80 0.0.0.0:*\\n"' \
     'fi' > "$mock_bin/ss"
+# shellcheck disable=SC2016
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'service="${*: -1}"' \

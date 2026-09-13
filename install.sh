@@ -1824,6 +1824,8 @@ configure_renewal() {
     local post_hook="$hooks_root/post/start-3ax-ui-nginx"
 
     mkdir -p "$hooks_root/deploy" "$hooks_root/pre" "$hooks_root/post"
+    # Variables below intentionally expand later inside the generated hook.
+    # shellcheck disable=SC2016
     printf '%s\n' \
         '#!/bin/sh' \
         'marker=/run/3ax-ui-certbot-nginx-stopped' \
@@ -1832,6 +1834,8 @@ configure_renewal() {
         '    ss -H -ltn 2>/dev/null | grep -Eq "(^|[[:space:]])[^[:space:]]*:80([[:space:]]|$)"; then' \
         '    systemctl stop nginx.service && : > "$marker"' \
         'fi' > "$pre_hook"
+    # Variables below intentionally expand later inside the generated hook.
+    # shellcheck disable=SC2016
     printf '%s\n' \
         '#!/bin/sh' \
         'marker=/run/3ax-ui-certbot-nginx-stopped' \
