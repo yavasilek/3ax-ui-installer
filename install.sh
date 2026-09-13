@@ -17,7 +17,8 @@ readonly AWG_IPV4_UPDATE_TRIGGER="trg_3ax_ipv4_only_client_routes_update"
 readonly AMNEZIA_PPA_FINGERPRINT="75C9DD72C799870E310542E24166F2C257290828"
 readonly AMNEZIA_PPA_KEYRING="/usr/share/keyrings/3ax-ui-amnezia-ppa.gpg"
 readonly AMNEZIA_PPA_SOURCE="/etc/apt/sources.list.d/3ax-ui-amnezia.sources"
-readonly UBUNTU_PRIMARY_ARCHIVE="https://launchpad.net/ubuntu/+archive/primary/+files"
+readonly LAUNCHPAD_API_ROOT="https://api.launchpad.net/1.0"
+readonly UBUNTU_SNAPSHOT_ARCHIVE="https://snapshot.ubuntu.com/ubuntu"
 readonly -a AMNEZIAWG_PACKAGES=(amneziawg amneziawg-dkms amneziawg-tools)
 
 UPSTREAM_SCRIPT=""
@@ -541,16 +542,73 @@ ubuntu_running_kernel_package_version() {
     return 1
 }
 
-ubuntu_primary_archive_package_url() {
+ubuntu_snapshot_locator() {
     local package="$1"
-    local package_version="${2#*:}"
+    local package_version="$2"
     local architecture="$3"
+    local api_url="$LAUNCHPAD_API_ROOT/ubuntu/+archive/primary"
 
-    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    curl -fsSLG --retry 3 --connect-timeout 15 --max-time 60 \
+        --data-urlencode 'ws.op=getPublishedBinaries' \
+        --data-urlencode "binary_name=$package" \
+        --data-urlencode 'exact_match=true' \
+        --data-urlencode "distro_arch_series=$LAUNCHPAD_API_ROOT/ubuntu/${VERSION_CODENAME}/$architecture" \
+        --data-urlencode 'order_by=published_date_desc' \
+        "$api_url" | python3 -c '
+import datetime
+import json
+import sys
+
+expected_version = sys.argv[1]
+entries = [
+    entry for entry in json.load(sys.stdin).get("entries", [])
+    if entry.get("binary_package_version") and entry.get("date_published")
+]
+if not entries:
+    raise SystemExit(1)
+matching = [
+    entry for entry in entries
+    if entry["binary_package_version"] == expected_version
+]
+selected_version = expected_version if matching else entries[0]["binary_package_version"]
+selected = [
+    entry for entry in entries
+    if entry["binary_package_version"] == selected_version
+]
+entry = min(selected, key=lambda item: item["date_published"])
+published = datetime.datetime.fromisoformat(
+    entry["date_published"].replace("Z", "+00:00")
+)
+snapshot = (published + datetime.timedelta(days=1)).astimezone(datetime.timezone.utc)
+print(
+    entry["component_name"],
+    entry["source_package_name"],
+    snapshot.strftime("%Y%m%dT%H%M%SZ"),
+    selected_version,
+    sep="\t",
+)
+' "$package_version"
+}
+
+ubuntu_snapshot_package_url() {
+    local snapshot_id="$1"
+    local component="$2"
+    local source_package="$3"
+    local package="$4"
+    local package_version="${5#*:}"
+    local architecture="$6"
+
+    [[ "$snapshot_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || return 1
+    [[ "$component" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
+    [[ "$source_package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
+    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
     [[ "$package_version" =~ ^[0-9A-Za-z.+~:-]+$ ]] || return 1
     [[ "$architecture" =~ ^[a-z0-9]+$ ]] || return 1
-    printf '%s/%s_%s_%s.deb\n' \
-        "$UBUNTU_PRIMARY_ARCHIVE" "$package" "$package_version" "$architecture"
+    printf '%s/%s/pool/%s/%s/%s/%s_%s_%s.deb\n' \
+        "$UBUNTU_SNAPSHOT_ARCHIVE" "$snapshot_id" "$component" \
+        "${source_package:0:1}" "$source_package" \
+        "$package" "$package_version" "$architecture"
 }
 
 validate_deb_identity() {
@@ -575,6 +633,11 @@ install_archived_ubuntu_kernel_headers() {
     local kernel_version="$1"
     local package_version
     local architecture
+    local component
+    local source_package
+    local snapshot_id
+    local header_package_version
+    local snapshot_locator
     local base_package
     local flavor_package
     local base_file
@@ -591,13 +654,21 @@ install_archived_ubuntu_kernel_headers() {
     [[ ${#header_packages[@]} -eq 2 ]] || return 1
     base_package="${header_packages[0]}"
     flavor_package="${header_packages[1]}"
-    base_url="$(ubuntu_primary_archive_package_url "$base_package" "$package_version" all)" || return 1
-    flavor_url="$(ubuntu_primary_archive_package_url "$flavor_package" "$package_version" "$architecture")" || return 1
+    snapshot_locator="$(ubuntu_snapshot_locator \
+        "$flavor_package" "$package_version" "$architecture")" || return 1
+    IFS=$'\t' read -r component source_package snapshot_id header_package_version <<< "$snapshot_locator"
+    package_version="$header_package_version"
+    base_url="$(ubuntu_snapshot_package_url \
+        "$snapshot_id" "$component" "$source_package" \
+        "$base_package" "$package_version" all)" || return 1
+    flavor_url="$(ubuntu_snapshot_package_url \
+        "$snapshot_id" "$component" "$source_package" \
+        "$flavor_package" "$package_version" "$architecture")" || return 1
 
     temp_dir="$(mktemp -d /tmp/3ax-ui-kernel-headers.XXXXXX)"
     base_file="$temp_dir/$base_package.deb"
     flavor_file="$temp_dir/$flavor_package.deb"
-    info "The repository no longer indexes headers for $kernel_version; using Ubuntu's official package archive"
+    info "The repository no longer indexes headers for $kernel_version; using Ubuntu Snapshot $snapshot_id"
 
     if ! curl -fL --retry 3 --connect-timeout 15 --max-time 300 \
         -o "$base_file" "$base_url" || \

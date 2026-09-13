@@ -48,14 +48,15 @@ mapfile -t ubuntu_header_packages < <(ubuntu_kernel_header_package_names '6.8.0-
 [[ ${#ubuntu_header_packages[@]} -eq 2 ]]
 [[ "${ubuntu_header_packages[0]}" == 'linux-headers-6.8.0-35' ]]
 [[ "${ubuntu_header_packages[1]}" == 'linux-headers-6.8.0-35-generic' ]]
-[[ "$(ubuntu_primary_archive_package_url \
-    linux-headers-6.8.0-35 6.8.0-35.35 all)" == \
-    'https://launchpad.net/ubuntu/+archive/primary/+files/linux-headers-6.8.0-35_6.8.0-35.35_all.deb' ]]
-[[ "$(ubuntu_primary_archive_package_url \
-    linux-headers-6.8.0-35-generic 6.8.0-35.35 amd64)" == \
-    'https://launchpad.net/ubuntu/+archive/primary/+files/linux-headers-6.8.0-35-generic_6.8.0-35.35_amd64.deb' ]]
+[[ "$(ubuntu_snapshot_package_url \
+    20240605T000000Z main linux linux-headers-6.8.0-35 6.8.0-35.35 all)" == \
+    'https://snapshot.ubuntu.com/ubuntu/20240605T000000Z/pool/main/l/linux/linux-headers-6.8.0-35_6.8.0-35.35_all.deb' ]]
+[[ "$(ubuntu_snapshot_package_url \
+    20240605T000000Z main linux linux-headers-6.8.0-35-generic 6.8.0-35.35 amd64)" == \
+    'https://snapshot.ubuntu.com/ubuntu/20240605T000000Z/pool/main/l/linux/linux-headers-6.8.0-35-generic_6.8.0-35.35_amd64.deb' ]]
 assert_fails ubuntu_kernel_header_package_names 'invalid kernel'
-assert_fails ubuntu_primary_archive_package_url '../bad' 1.0 amd64
+assert_fails ubuntu_snapshot_package_url invalid main linux package 1.0 amd64
+assert_fails ubuntu_snapshot_package_url 20240605T000000Z '../bad' linux package 1.0 amd64
 
 normalized_ports="$(printf '%s\n' 2222 22 invalid 22 0 65535 65536 | normalize_ssh_ports)"
 [[ "$normalized_ports" == "22,2222,65535" ]]
@@ -175,6 +176,7 @@ grep -Fq 'amneziawg_available_updates' <<< "$(declare -f install_amneziawg_stack
 grep -Fq 'reload_amneziawg_module_if_needed' <<< "$(declare -f install_amneziawg_stack)"
 grep -Fq 'ensure_running_kernel_headers' <<< "$(declare -f install_amneziawg_stack)"
 grep -Fq 'validate_deb_identity' <<< "$(declare -f install_archived_ubuntu_kernel_headers)"
+grep -Fq 'ubuntu_snapshot_locator' <<< "$(declare -f install_archived_ubuntu_kernel_headers)"
 if grep -Fq "$state_cleanup" <<< "$save_credentials_definition"; then
     printf 'Credentials must be saved before the resumable state is removed.\n' >&2
     exit 1
