@@ -161,6 +161,8 @@ configure_panel_definition="$(declare -f configure_panel)"
 main_definition="$(declare -f main)"
 on_exit_definition="$(declare -f on_exit)"
 save_credentials_definition="$(declare -f save_credentials)"
+http_challenge_definition="$(declare -f ensure_http_challenge_available)"
+renewal_definition="$(declare -f configure_renewal)"
 # These are intentional literal fragments from the sourced function bodies.
 # shellcheck disable=SC2016
 state_guard='! -s "$STATE_FILE"'
@@ -177,6 +179,11 @@ grep -Fq 'reload_amneziawg_module_if_needed' <<< "$(declare -f install_amneziawg
 grep -Fq 'ensure_running_kernel_headers' <<< "$(declare -f install_amneziawg_stack)"
 grep -Fq 'validate_deb_identity' <<< "$(declare -f install_archived_ubuntu_kernel_headers)"
 grep -Fq 'ubuntu_snapshot_locator' <<< "$(declare -f install_archived_ubuntu_kernel_headers)"
+grep -Fq 'systemctl stop nginx.service' <<< "$http_challenge_definition"
+grep -Fq 'restore_http_challenge_nginx' <<< "$http_challenge_definition"
+grep -Fq 'stop-3ax-ui-nginx' <<< "$renewal_definition"
+grep -Fq 'start-3ax-ui-nginx' <<< "$renewal_definition"
+grep -Fq 'HTTP_CHALLENGE_NGINX_WAS_ACTIVE' <<< "$on_exit_definition"
 if grep -Fq "$state_cleanup" <<< "$save_credentials_definition"; then
     printf 'Credentials must be saved before the resumable state is removed.\n' >&2
     exit 1
@@ -198,5 +205,41 @@ fi
 
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$mock_bin/dpkg"
 PATH="$mock_bin:$PATH" check_package_manager_health
+
+# Variables below intentionally expand later inside the generated mock scripts.
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ -e "${MOCK_NGINX_ACTIVE:?}" ]]; then' \
+    '    printf "LISTEN 0 511 0.0.0.0:80 0.0.0.0:*\\n"' \
+    'fi' > "$mock_bin/ss"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'service="${*: -1}"' \
+    'case "${1:-}:$service" in' \
+    '    is-active:nginx.service) [[ -e "${MOCK_NGINX_ACTIVE:?}" ]] ;;' \
+    '    stop:nginx.service) rm -f -- "$MOCK_NGINX_ACTIVE"; : > "$MOCK_NGINX_STOPPED" ;;' \
+    '    start:nginx.service) : > "$MOCK_NGINX_ACTIVE"; : > "$MOCK_NGINX_STARTED" ;;' \
+    '    *) exit 1 ;;' \
+    'esac' > "$mock_bin/systemctl"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "Status: inactive\\n"' > "$mock_bin/ufw"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$mock_bin/firewall-cmd"
+chmod +x "$mock_bin/ss" "$mock_bin/systemctl" "$mock_bin/ufw" "$mock_bin/firewall-cmd"
+
+export MOCK_NGINX_ACTIVE="$mock_bin/nginx-active"
+export MOCK_NGINX_STOPPED="$mock_bin/nginx-stopped"
+export MOCK_NGINX_STARTED="$mock_bin/nginx-started"
+: > "$MOCK_NGINX_ACTIVE"
+HTTP_CHALLENGE_NGINX_WAS_ACTIVE=0
+PATH="$mock_bin:$PATH"
+ensure_http_challenge_available
+[[ "$HTTP_CHALLENGE_NGINX_WAS_ACTIVE" -eq 1 ]]
+[[ -e "$MOCK_NGINX_STOPPED" ]]
+[[ ! -e "$MOCK_NGINX_ACTIVE" ]]
+restore_http_challenge_nginx
+[[ "$HTTP_CHALLENGE_NGINX_WAS_ACTIVE" -eq 0 ]]
+[[ -e "$MOCK_NGINX_STARTED" ]]
+[[ -e "$MOCK_NGINX_ACTIVE" ]]
 
 printf 'Smoke tests passed.\n'

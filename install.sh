@@ -26,6 +26,7 @@ UPSTREAM_LOG=""
 AWG_REPAIR_PENDING=0
 CREDENTIALS_PRINTED=0
 UPDATE_BACKUP_DIR=""
+HTTP_CHALLENGE_NGINX_WAS_ACTIVE=0
 
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -47,6 +48,12 @@ die() {
 
 on_exit() {
     local exit_code=$?
+
+    if [[ "$HTTP_CHALLENGE_NGINX_WAS_ACTIVE" -eq 1 ]]; then
+        systemctl start nginx.service >/dev/null 2>&1 || \
+            warn "nginx could not be restarted after the interrupted certificate request."
+        HTTP_CHALLENGE_NGINX_WAS_ACTIVE=0
+    fi
 
     if [[ -n "$UPSTREAM_SCRIPT" && -f "$UPSTREAM_SCRIPT" ]]; then
         rm -f -- "$UPSTREAM_SCRIPT"
@@ -1532,9 +1539,35 @@ ensure_enabled_awg_runtime() {
     info "AmneziaWG was restored without changing clients or keys ($interface_name, UDP $listen_port)"
 }
 
+tcp_port_is_listening() {
+    local port="$1"
+
+    ss -H -ltn 2>/dev/null \
+        | grep -Eq "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)"
+}
+
+restore_http_challenge_nginx() {
+    [[ "$HTTP_CHALLENGE_NGINX_WAS_ACTIVE" -eq 1 ]] || return
+
+    info "Starting nginx again after the HTTPS certificate request"
+    systemctl start nginx.service >/dev/null 2>&1 || return 1
+    HTTP_CHALLENGE_NGINX_WAS_ACTIVE=0
+}
+
 ensure_http_challenge_available() {
-    if ss -H -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:80([[:space:]]|$)'; then
-        die "TCP port 80 is already in use. This installer is intended for a clean VPS and needs port 80 for HTTPS."
+    if tcp_port_is_listening 80 && systemctl is-active --quiet nginx.service; then
+        info "Temporarily stopping nginx to free TCP port 80 for HTTPS"
+        HTTP_CHALLENGE_NGINX_WAS_ACTIVE=1
+        if ! systemctl stop nginx.service; then
+            HTTP_CHALLENGE_NGINX_WAS_ACTIVE=0
+            die "nginx is using TCP port 80 and could not be stopped for the HTTPS certificate request."
+        fi
+    fi
+
+    if tcp_port_is_listening 80; then
+        ss -H -ltnp 2>/dev/null | grep -E '(^|[[:space:]])[^[:space:]]*:80([[:space:]]|$)' >&2 || true
+        restore_http_challenge_nginx || true
+        die "TCP port 80 is in use by a service other than the installer-managed nginx."
     fi
 
     open_firewall_port 80 tcp
@@ -1765,7 +1798,7 @@ obtain_certificate() {
 
     ensure_http_challenge_available
     info "Obtaining a trusted HTTPS certificate for $DOMAIN"
-    certbot certonly \
+    if ! certbot certonly \
         --standalone \
         --non-interactive \
         --agree-tos \
@@ -1774,19 +1807,49 @@ obtain_certificate() {
         --key-type rsa \
         --rsa-key-size 2048 \
         --cert-name "$DOMAIN" \
-        -d "$DOMAIN"
+        -d "$DOMAIN"; then
+        restore_http_challenge_nginx || true
+        die "The HTTPS certificate request failed. Check that inbound TCP port 80 reaches this server."
+    fi
 
     [[ -s "$cert_dir/fullchain.pem" && -s "$cert_dir/privkey.pem" ]] || \
         die "Certbot did not create the expected certificate files."
+    restore_http_challenge_nginx || die "nginx could not be restarted after the HTTPS certificate request."
 }
 
 configure_renewal() {
-    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
-    local hook="$hook_dir/restart-3ax-ui"
+    local hooks_root="/etc/letsencrypt/renewal-hooks"
+    local deploy_hook="$hooks_root/deploy/restart-3ax-ui"
+    local pre_hook="$hooks_root/pre/stop-3ax-ui-nginx"
+    local post_hook="$hooks_root/post/start-3ax-ui-nginx"
 
-    mkdir -p "$hook_dir"
-    printf '%s\n' '#!/bin/sh' 'systemctl try-restart x-ui.service >/dev/null 2>&1 || true' > "$hook"
-    chmod 755 "$hook"
+    mkdir -p "$hooks_root/deploy" "$hooks_root/pre" "$hooks_root/post"
+    # Variables below intentionally expand later inside the generated hook.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'marker=/run/3ax-ui-certbot-nginx-stopped' \
+        'rm -f -- "$marker"' \
+        'if systemctl is-active --quiet nginx.service &&' \
+        '    ss -H -ltn 2>/dev/null | grep -Eq "(^|[[:space:]])[^[:space:]]*:80([[:space:]]|$)"; then' \
+        '    systemctl stop nginx.service && : > "$marker"' \
+        'fi' > "$pre_hook"
+    # Variables below intentionally expand later inside the generated hook.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'marker=/run/3ax-ui-certbot-nginx-stopped' \
+        'if [ -e "$marker" ]; then' \
+        '    if systemctl start nginx.service; then' \
+        '        rm -f -- "$marker"' \
+        '    else' \
+        '        exit 1' \
+        '    fi' \
+        'fi' > "$post_hook"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'systemctl try-restart x-ui.service >/dev/null 2>&1 || true' > "$deploy_hook"
+    chmod 755 "$pre_hook" "$post_hook" "$deploy_hook"
     systemctl enable --now certbot.timer >/dev/null 2>&1 || \
         warn "certbot.timer could not be enabled; certificate renewal must be checked manually."
 }
