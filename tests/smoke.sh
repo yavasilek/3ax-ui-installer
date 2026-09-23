@@ -96,6 +96,36 @@ assert_fails normalize_xui_version "not-a-version"
 version_is_older "1.6.5" "1.7.0"
 assert_fails version_is_older "1.7.0" "1.7.0"
 assert_fails version_is_older "1.8.0" "1.7.0"
+[[ "$(upstream_tag_from_release_api '{"tag_name":"v1.8.1"}')" == "v1.8.1" ]]
+[[ "$(upstream_tag_from_release_url \
+    'https://github.com/coinman-dev/3ax-ui/releases/tag/v1.8.1')" == "v1.8.1" ]]
+assert_fails upstream_tag_from_release_url \
+    'https://example.com/coinman-dev/3ax-ui/releases/tag/v1.8.1'
+
+curl() {
+    local argument
+
+    for argument in "$@"; do
+        case "$argument" in
+            "$UPSTREAM_RELEASES_API_URL") return 22 ;;
+            "$UPSTREAM_RELEASES_LATEST_URL")
+                printf '%s' 'https://github.com/coinman-dev/3ax-ui/releases/tag/v1.8.1'
+                return
+                ;;
+        esac
+    done
+    return 1
+}
+[[ "$(fetch_latest_upstream_tag)" == "v1.8.1" ]]
+unset -f curl
+
+update_probe="$(
+    installed_upstream_version() { printf '%s\n' '1.7.0'; }
+    fetch_latest_upstream_tag() { printf '%s\n' 'v1.8.1'; }
+    run_upstream_update() { printf 'update:%s:%s:%s\n' "$1" "$2" "$3"; }
+    maybe_update_upstream_panel
+)"
+grep -Fxq 'update:1.7.0:v1.8.1:1.8.1' <<< "$update_probe"
 
 load_credentials_file <(printf '%s\n' \
     'URL: https://185-105-226-75.sslip.io:50409/4799d94d0547a1a6f1fa640c2f87dbf7/' \
@@ -179,6 +209,9 @@ grep -Fq "$state_guard" <<< "$main_definition"
 grep -Fq 'CREDENTIALS_PRINTED' <<< "$on_exit_definition"
 grep -Fq 'maybe_update_upstream_panel' <<< "$main_definition"
 grep -Fq 'rollback_panel_update' <<< "$(declare -f run_upstream_update)"
+main_update_line="$(grep -nF 'maybe_update_upstream_panel' <<< "$main_definition" | cut -d: -f1)"
+main_state_guard_line="$(grep -nF "$state_guard" <<< "$main_definition" | cut -d: -f1)"
+[[ "$main_update_line" -lt "$main_state_guard_line" ]]
 grep -Fq 'amneziawg_available_updates' <<< "$(declare -f install_amneziawg_stack)"
 grep -Fq 'reload_amneziawg_module_if_needed' <<< "$(declare -f install_amneziawg_stack)"
 grep -Fq 'ensure_running_kernel_headers' <<< "$(declare -f install_amneziawg_stack)"
