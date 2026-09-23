@@ -4,6 +4,8 @@ set -Eeuo pipefail
 
 readonly UPSTREAM_INSTALL_URL="https://raw.githubusercontent.com/coinman-dev/3ax-ui/main/install.sh"
 readonly UPSTREAM_UPDATE_URL="https://raw.githubusercontent.com/coinman-dev/3ax-ui/main/update.sh"
+readonly UPSTREAM_RELEASES_API_URL="https://api.github.com/repos/coinman-dev/3ax-ui/releases/latest"
+readonly UPSTREAM_RELEASES_LATEST_URL="https://github.com/coinman-dev/3ax-ui/releases/latest"
 readonly XUI_DIR="/usr/local/x-ui"
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
 readonly XUI_DB="/etc/x-ui/x-ui.db"
@@ -1807,11 +1809,46 @@ version_is_older() {
 
 fetch_latest_upstream_tag() {
     local response=""
+    local final_url=""
     local tag=""
 
-    response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
-        https://api.github.com/repos/coinman-dev/3ax-ui/releases/latest)" || return 1
-    tag="$(sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$response" | sed -n '1p')"
+    if response="$(curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: 3ax-ui-installer' \
+        "$UPSTREAM_RELEASES_API_URL")"; then
+        tag="$(upstream_tag_from_release_api "$response" || true)"
+        if [[ -n "$tag" ]]; then
+            printf '%s\n' "$tag"
+            return
+        fi
+    fi
+
+    final_url="$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 10 --max-time 30 \
+        -o /dev/null -w '%{url_effective}' \
+        "$UPSTREAM_RELEASES_LATEST_URL")" || return 1
+    upstream_tag_from_release_url "$final_url"
+}
+
+upstream_tag_from_release_api() {
+    local response="$1"
+    local tag=""
+
+    tag="$(sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+        <<< "$response" | sed -n '1p')"
+    normalize_xui_version "$tag" >/dev/null || return 1
+    printf '%s\n' "$tag"
+}
+
+upstream_tag_from_release_url() {
+    local release_url="$1"
+    local prefix="https://github.com/coinman-dev/3ax-ui/releases/tag/"
+    local tag=""
+
+    [[ "$release_url" == "$prefix"* ]] || return 1
+    tag="${release_url#"$prefix"}"
+    [[ "$tag" != */* && "$tag" != *\?* && "$tag" != *\#* ]] || return 1
     normalize_xui_version "$tag" >/dev/null || return 1
     printf '%s\n' "$tag"
 }
@@ -1958,6 +1995,7 @@ maybe_update_upstream_panel() {
     }
     latest_version="$(normalize_xui_version "$latest_tag")" || \
         die "The latest 3AX-UI release has an invalid version tag."
+    info "3AX-UI version check: installed v$current_version, stable $latest_tag"
 
     if version_is_older "$current_version" "$latest_version"; then
         run_upstream_update "$current_version" "$latest_tag" "$latest_version"
@@ -2195,14 +2233,16 @@ main() {
     configure_fail2ban_ssh
     install_amneziawg_stack
 
-    if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" && ! -s "$STATE_FILE" ]]; then
+    if [[ -x "$XUI_BIN" && -s "$CREDENTIALS_FILE" ]]; then
         load_saved_credentials
         maybe_update_upstream_panel
-        configure_awg_mobile_compatibility
-        ensure_enabled_awg_runtime
-        verify_panel
-        print_credentials
-        exit 0
+        if [[ ! -s "$STATE_FILE" ]]; then
+            configure_awg_mobile_compatibility
+            ensure_enabled_awg_runtime
+            verify_panel
+            print_credentials
+            exit 0
+        fi
     fi
 
     load_or_create_state

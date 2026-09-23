@@ -13,12 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Bash syntax
-        run: bash -n install.sh tests/smoke.sh tests/ubuntu-snapshot-smoke.sh tests/debian-snapshot-smoke.sh
+        run: bash -n install.sh tests/smoke.sh tests/ubuntu-snapshot-smoke.sh tests/debian-snapshot-smoke.sh tests/upstream-release-smoke.sh
       - name: ShellCheck
-        run: shellcheck install.sh tests/smoke.sh tests/ubuntu-snapshot-smoke.sh tests/debian-snapshot-smoke.sh
+        run: shellcheck install.sh tests/smoke.sh tests/ubuntu-snapshot-smoke.sh tests/debian-snapshot-smoke.sh tests/upstream-release-smoke.sh
       - name: Smoke tests
         run: bash tests/smoke.sh
       - name: Ubuntu Snapshot headers smoke test
         run: bash tests/ubuntu-snapshot-smoke.sh
       - name: Debian Snapshot headers smoke test
         run: bash tests/debian-snapshot-smoke.sh
+      - name: 3AX-UI stable release smoke test
+        run: bash tests/upstream-release-smoke.sh
