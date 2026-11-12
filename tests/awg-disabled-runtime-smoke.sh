@@ -7,7 +7,10 @@ source "$repo_root/install.sh"
 # Replace only the filesystem precondition with harmless existing fixtures;
 # every service/tool operation below is mocked. No real VPN is managed.
 definition="$(declare -f ensure_enabled_awg_runtime)"
+# Match the literal variable references in the function body.
+# shellcheck disable=SC2016
 definition="${definition//'"$XUI_BIN"'/'"/bin/bash"'}"
+# shellcheck disable=SC2016
 definition="${definition//'"$XUI_DB"'/'"/etc/os-release"'}"
 eval "$definition"
 systemctl() {
