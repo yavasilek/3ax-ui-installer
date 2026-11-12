@@ -306,7 +306,7 @@ amneziawg_available_updates() {
 
     for package in "${AMNEZIAWG_PACKAGES[@]}"; do
         candidate_version="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null \
-            | awk '$1 == "Candidate:" {print $2; exit}')"
+            | awk '$1 == "Candidate:" && !found {print $2; found=1}')"
         [[ -n "$candidate_version" && "$candidate_version" != "(none)" ]] || continue
         if ! installed_version="$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null)"; then
             printf '%s\t%s\t%s\n' "$package" "not-installed" "$candidate_version"
@@ -522,8 +522,10 @@ amneziawg_server_smoke_test() {
 }
 
 apt_package_candidate_version() {
+    # Drain all policy output: exiting awk early can SIGPIPE apt-cache under
+    # pipefail, incorrectly aborting an otherwise healthy installation.
     LC_ALL=C apt-cache policy "$1" 2>/dev/null \
-        | awk '$1 == "Candidate:" && $2 != "(none)" {print $2; exit}'
+        | awk '$1 == "Candidate:" && $2 != "(none)" && !found {print $2; found=1}'
 }
 
 ubuntu_kernel_header_package_names() {
@@ -1580,14 +1582,14 @@ configure_awg_mobile_compatibility() {
     local sql
     local changed=0
 
-    [[ -s "$XUI_DB" ]] || return
-    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_servers';" 2>/dev/null)" == "1" ]] || return
-    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_clients';" 2>/dev/null)" == "1" ]] || return
+    [[ -s "$XUI_DB" ]] || return 0
+    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_servers';" 2>/dev/null)" == "1" ]] || return 0
+    [[ "$(sqlite3_clean "$XUI_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='awg_clients';" 2>/dev/null)" == "1" ]] || return 0
 
     server_row="$(sqlite3_clean -separator '|' "$XUI_DB" \
         "SELECT id, CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port, (SELECT count(*) FROM awg_clients WHERE server_id = awg_servers.id) FROM awg_servers ORDER BY id LIMIT 1;" \
         2>/dev/null || true)"
-    [[ -n "$server_row" ]] || return
+    [[ -n "$server_row" ]] || return 0
     IFS='|' read -r server_id enabled interface_name current_port client_count <<< "$server_row"
 
     [[ "$server_id" =~ ^[0-9]+$ && "$server_id" -ge 1 ]] || die "The AmneziaWG server has an invalid database ID."
@@ -1698,7 +1700,7 @@ ensure_enabled_awg_runtime() {
     local config_file
     local start_output=""
 
-    [[ -x "$XUI_BIN" && -s "$XUI_DB" ]] || return
+    [[ -x "$XUI_BIN" && -s "$XUI_DB" ]] || return 0
 
     systemctl enable x-ui.service >/dev/null 2>&1 || true
     if ! systemctl is-active --quiet x-ui.service; then
@@ -1708,9 +1710,9 @@ ensure_enabled_awg_runtime() {
     server_row="$(sqlite3_clean -separator '|' "$XUI_DB" \
         "SELECT CASE WHEN enable THEN 1 ELSE 0 END, COALESCE(NULLIF(interface_name, ''), 'awg0'), listen_port FROM awg_servers ORDER BY id LIMIT 1;" \
         2>/dev/null || true)"
-    [[ -n "$server_row" ]] || return
+    [[ -n "$server_row" ]] || return 0
     IFS='|' read -r enabled interface_name listen_port <<< "$server_row"
-    [[ "$enabled" == "1" ]] || return
+    [[ "$enabled" == "1" ]] || return 0
     valid_awg_interface_name "$interface_name" || \
         die "The enabled AmneziaWG server has an unsafe interface name in the panel database."
     [[ "$listen_port" =~ ^[0-9]+$ && "$listen_port" -ge 1 && "$listen_port" -le 65535 ]] || \

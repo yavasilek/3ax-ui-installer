@@ -13,9 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Bash syntax
-        run: bash -n install.sh tests/smoke.sh tests/ubuntu-snapshot-smoke.sh tests/debian-snapshot-smoke.sh tests/upstream-release-smoke.sh
+        run: |
+          for script in install.sh tests/*.sh; do
+            bash -n "$script"
+          done
       - name: ShellCheck
-        run: shellcheck install.sh tests/smoke.sh tests/ubuntu-snapshot-smoke.sh tests/debian-snapshot-smoke.sh tests/upstream-release-smoke.sh
+        run: shellcheck install.sh tests/*.sh
       - name: Smoke tests
         run: bash tests/smoke.sh
       - name: Ubuntu Snapshot headers smoke test
@@ -24,3 +27,7 @@ jobs:
         run: bash tests/debian-snapshot-smoke.sh
       - name: 3AX-UI stable release smoke test
         run: bash tests/upstream-release-smoke.sh
+      - name: APT policy pipefail regression
+        run: bash tests/apt-policy-pipefail-smoke.sh
+      - name: Disabled AWG runtime regression
+        run: bash tests/awg-disabled-runtime-smoke.sh

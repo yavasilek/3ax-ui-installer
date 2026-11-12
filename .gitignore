@@ -1,1 +1,11 @@
 *.log
+__pycache__/
+*.pyc
+
+# Private operator tools, infrastructure tests and local evidence.
+/.codex-local/
+/.codex-remote-attachments/
+/backups/
+/library.md
+/scripts/
+/tests/test_*.py
